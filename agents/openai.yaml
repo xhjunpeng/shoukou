@@ -1,0 +1,4 @@
+interface:
+  display_name: "任务收口"
+  short_description: "Safely audit and close Git task branches"
+  default_prompt: "Use $shoukou to safely close out the current Git task."
