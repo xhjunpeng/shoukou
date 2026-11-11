@@ -474,7 +474,7 @@ def check_task(repo, task, phase='final', decision_paths=(), stop_paths=()):
             if baseline_outputs['files'].get(name) != sig:
                 finding('output:' + name, sig, ('retained-output', 'other-task'))
         for name in baseline_outputs['files'].keys() - current['outputs']['files'].keys():
-            finding('removed-protected-output:' + name, baseline_outputs['files'][name])
+            finding('removed-protected-output:' + name, baseline_outputs['files'][name], ('reviewed-removal',))
         for name in sorted(set(current['outputs']['uncovered'] + baseline_outputs['uncovered'])):
             finding('uncovered-output-root:' + name, {'limit': LIMIT})
         if 'cleanup' in state['requirements'] and not cfg['output_roots']:

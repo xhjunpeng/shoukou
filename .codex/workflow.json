@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "main_branch": "main",
+  "remote": "origin",
+  "output_roots": [
+    ".runtime"
+  ],
+  "tests": {
+    "reviewed-removal": [
+      "python3",
+      "-B",
+      "-m",
+      "unittest",
+      "discover",
+      "-s",
+      "tests",
+      "-p",
+      "test_reviewed_output_removal.py"
+    ]
+  }
+}
