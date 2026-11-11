@@ -234,18 +234,25 @@ def observation(repo, cfg):
 
 
 @contextlib.contextmanager
-def store(repo, task):
+def store(repo, task, wait_seconds=0):
     require(isinstance(task, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,79}', task) and task not in ('.', '..'), 'Explicit safe task ID required')
+    require(type(wait_seconds) in (int, float) and 0 <= wait_seconds <= 5, 'Lock wait must be between zero and five seconds')
     folder = common_of(repo) / 'codex-workflow'
     no_links(folder)
     folder.mkdir(mode=0o700, exist_ok=True)
     no_links(folder / '.lock')
     fd = os.open(folder / '.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise ValueError('Task state is locked; retry without resetting it') from None
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ValueError('Task state is locked; retry without resetting it') from None
+                time.sleep(min(0.05, remaining))
         yield folder, folder / (task + '.json')
     finally:
         os.close(fd)
@@ -309,6 +316,34 @@ def group_active(group):
         return None
     return any(len(parts) >= 2 and parts[0] == str(group) and not parts[1].startswith('Z')
                for parts in (line.split() for line in p.stdout.splitlines()))
+
+
+def runner_active(pid):
+    if type(pid) is not int or pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return None
+    return True
+
+
+def reclaimed_interruption(entry):
+    """Observe absent work and retained logs; never infer an old exit result."""
+    try:
+        root = no_links(Path(entry['root']))
+        info = root.lstat()
+        if (not root.is_absolute() or not root.name.startswith('codex-task-guard-')
+                or not stat.S_ISDIR(info.st_mode)
+                or [info.st_dev, info.st_ino] != entry['root_identity']):
+            return False
+        logs = [no_links(root / 'evidence' / name) for name in ['stdout.log', 'stderr.log']]
+        work = root / 'work'
+        return not work.exists() and not work.is_symlink() and all(path.is_file() for path in logs)
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
 
 
 def run_temp_root(repo):
@@ -403,6 +438,7 @@ def check_task(repo, task, phase='final', decision_paths=(), stop_paths=()):
         state = regular_json(path)
         require(state['repo'] == str(repo) and state['config_sha256'] == cfg_hash, 'Configuration/repository drift; baseline not reset')
         before = state['baseline']; current = observation(repo, cfg); pending = []
+        reconciled = []
         baseline_trees = dict(before['worktrees'], **state.get('additional_baselines', {}))
         def finding(key, facts, allowed=()):
             pending.append({'object': key, 'version': digest([task, key, facts]), 'facts': facts, 'allowed_decisions': list(allowed)})
@@ -493,9 +529,21 @@ def check_task(repo, task, phase='final', decision_paths=(), stop_paths=()):
             finding('run:' + key, {'run_id': run['id'], 'status': run['status'], 'exit_code': run.get('exit_code'),
                     'violations': run.get('violations'), 'group_active_now': group_active(run.get('pgid'))})
         if 'cleanup' in state['requirements']:
-            for run in state['runs']:
+            for position, run in enumerate(state['runs']):
                 run_root = Path(run['root'])
                 active = group_active(run.get('pgid'))
+                replay = next((item for item in reversed(state['runs'][position + 1:])
+                               if item['command_key'] == run['command_key']), {})
+                if (run.get('status') in ('running', 'interrupted') and active is False
+                        and runner_active(run.get('runner_pid')) is False and reclaimed_interruption(run)
+                        and replay.get('status') == 'complete' and replay.get('exit_code') == 0
+                        and not replay.get('violations') and replay.get('candidate') == candidate
+                        and evidence_ok(replay.get('receipt'))):
+                    reconciled.append({'run_id': run['id'], 'original_status': run['status'],
+                                       'replayed_by': replay['id'], 'process_group_active': False,
+                                       'runner_active': False, 'work_absent': True,
+                                       'retained_evidence': str(run_root / 'evidence')})
+                    continue
                 if run.get('status') != 'complete' or active is not False:
                     finding('run-resource:' + run['id'], {'status': run['status'], 'active_group': active, 'root': str(run_root)})
                 elif (run_root / 'work').exists():
@@ -558,7 +606,8 @@ def check_task(repo, task, phase='final', decision_paths=(), stop_paths=()):
         atomic(path, state)
     return {'schema_version': 1, **execution, 'phase': phase, 'completion_scope': 'saved-stage-only' if phase == 'save' else 'selected-task-final',
             'machine_checks_complete': execution['state'] == 'complete', 'task': task, 'candidate': candidate,
-            'accepted_decisions': accepted, 'original_main': state['main_root'], 'boundary': BOUNDARY}
+            'accepted_decisions': accepted, 'reconciled_run_resources': reconciled,
+            'original_main': state['main_root'], 'boundary': BOUNDARY}
 
 
 def run_task(repo, task, argv, test_name=None):
@@ -570,7 +619,9 @@ def run_task(repo, task, argv, test_name=None):
     with store(repo, task) as (folder, path):
         state = regular_json(path)
         require(state['config_sha256'] == cfg_hash and state['repo'] == str(repo), 'Configuration/repository drift')
-        require(not any(r.get('status') == 'running' and group_active(r.get('pgid')) is not False for r in state['runs']), 'Another run is active or its exit is unknown')
+        require(not any(r.get('status') == 'running'
+                        and (group_active(r.get('pgid')) is not False or runner_active(r.get('runner_pid')) is not False)
+                        for r in state['runs']), 'Another run is active or its exit is unknown')
         require(len(state['runs']) < MAX_RUNS, 'Run evidence limit reached; preserve failures and review/archive records explicitly')
         first = observation(repo, cfg)
         run_id = uuid.uuid4().hex
@@ -602,7 +653,7 @@ def run_task(repo, task, argv, test_name=None):
         for thread in threads:
             thread.start()
         entry['pgid'] = child.pid
-        with store(repo, task) as (_, path):
+        with store(repo, task, wait_seconds=5) as (_, path):
             state = regular_json(path); state['runs'][-1] = entry; atomic(path, state)
         code = child.wait()
         for thread in threads:
@@ -628,10 +679,10 @@ def run_task(repo, task, argv, test_name=None):
                      work_reclaimed=not work.exists(), evidence=str(evidence), finished_at=time.time())
     except BaseException as error:
         entry.update(status='interrupted', error_type=type(error).__name__)
-        with store(repo, task) as (_, path):
+        with store(repo, task, wait_seconds=5) as (_, path):
             state = regular_json(path); state['runs'][-1] = entry; atomic(path, state)
         raise
-    with store(repo, task) as (_, path):
+    with store(repo, task, wait_seconds=5) as (_, path):
         atomic(evidence / 'result.json', entry)
         entry['receipt'] = {'path': str(evidence / 'result.json'), 'sha256': signature(evidence / 'result.json')['sha256']}
         state = regular_json(path); state['runs'][-1] = entry; atomic(path, state)

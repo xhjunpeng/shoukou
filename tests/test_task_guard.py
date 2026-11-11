@@ -11,6 +11,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -82,6 +83,89 @@ class TaskGuardTests(unittest.TestCase):
 
     def cli(self, *args):
         return subprocess.run([sys.executable, '-B', str(SCRIPT), '--repo', str(self.repo), *args], capture_output=True, text=True)
+
+    def test_optional_lock_wait_is_bounded(self):
+        with guard.store(self.repo, 'holder'):
+            started = time.monotonic()
+            with self.assertRaisesRegex(ValueError, 'locked'):
+                with guard.store(self.repo, 'task', wait_seconds=0.04):
+                    self.fail('The held lock must remain exclusive')
+            self.assertLess(time.monotonic() - started, 1)
+
+    def test_optional_lock_wait_resumes_after_release(self):
+        acquired, started, errors = threading.Event(), threading.Event(), []
+        def waiter():
+            started.set()
+            try:
+                with guard.store(self.repo, 'task', wait_seconds=0.5):
+                    acquired.set()
+            except Exception as error:
+                errors.append(error)
+        with guard.store(self.repo, 'holder'):
+            thread = threading.Thread(target=waiter)
+            thread.start()
+            self.assertTrue(started.wait(1))
+            self.assertFalse(acquired.wait(0.02))
+        thread.join(1)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(acquired.is_set())
+
+    def interrupted_after_reclamation(self):
+        self.begin(['cleanup'])
+        argv = [sys.executable, '-c', 'print("recorded fixture command")']
+        first = guard.run_task(self.repo, 'task', argv)['run']
+        state = self.state()
+        item = state['runs'][0]
+        item['status'], item['runner_pid'] = 'running', 2147483647
+        for key in ['exit_code', 'receipt', 'finished_at', 'violations', 'active_descendants', 'work_reclaimed', 'evidence']:
+            item.pop(key, None)
+        Path(first['receipt']['path']).unlink()
+        guard.atomic(self.repo / '.git/codex-workflow/task.json', state)
+        return argv, copy.deepcopy(item)
+
+    def test_reclaimed_interruption_requires_same_current_successful_replay(self):
+        argv, interrupted = self.interrupted_after_reclamation()
+        key = 'run-resource:' + interrupted['id']
+        self.assertIn(key, self.objects(self.check()))
+        guard.run_task(self.repo, 'task', [sys.executable, '-c', 'print("unrelated")'])
+        self.assertIn(key, self.objects(self.check()))
+        replay = guard.run_task(self.repo, 'task', argv)['run']
+        state = self.state()
+        state['runs'][-1]['receipt']['sha256'] = 'invalid'
+        guard.atomic(self.repo / '.git/codex-workflow/task.json', state)
+        self.assertIn(key, self.objects(self.check()))
+        state['runs'][-1]['receipt'] = replay['receipt']
+        guard.atomic(self.repo / '.git/codex-workflow/task.json', state)
+        checked = self.check()
+        self.assertEqual(checked['state'], 'complete')
+        self.assertEqual(checked['reconciled_run_resources'][0]['run_id'], interrupted['id'])
+        self.assertEqual(self.state()['runs'][0], interrupted)
+        self.assertNotIn('exit_code', self.state()['runs'][0])
+
+    def test_live_parent_remaining_work_or_changed_identity_prevents_reconciliation(self):
+        argv, interrupted = self.interrupted_after_reclamation()
+        guard.run_task(self.repo, 'task', argv)
+        key = 'run-resource:' + interrupted['id']
+        state = self.state()
+        state['runs'][0]['runner_pid'] = os.getpid()
+        guard.atomic(self.repo / '.git/codex-workflow/task.json', state)
+        self.assertIn(key, self.objects(self.check()))
+        state['runs'][0]['runner_pid'] = interrupted['runner_pid']
+        guard.atomic(self.repo / '.git/codex-workflow/task.json', state)
+        work = Path(interrupted['root']) / 'work'
+        work.mkdir()
+        self.assertIn(key, self.objects(self.check()))
+        work.rmdir()
+        work.symlink_to(self.base / 'missing-target')
+        self.assertIn(key, self.objects(self.check()))
+        work.unlink()
+        state['runs'][0]['root_identity'] = [0, 0]
+        guard.atomic(self.repo / '.git/codex-workflow/task.json', state)
+        self.assertIn(key, self.objects(self.check()))
+        state['runs'][0]['root_identity'] = interrupted['root_identity']
+        guard.atomic(self.repo / '.git/codex-workflow/task.json', state)
+        self.assertEqual(self.check()['state'], 'complete')
 
     def test_clean_task_and_preexisting_other_branch_do_not_require_global_cleanup(self):
         self.git('branch', 'other-task')
