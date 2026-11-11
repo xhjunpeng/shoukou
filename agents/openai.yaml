@@ -1,4 +1,4 @@
 interface:
   display_name: "任务收口"
-  short_description: "Safely audit and close Git task branches"
-  default_prompt: "Use $shoukou to 完整收口当前任务，包括候选分支与 main 中已确认属于该任务的改动。"
+  short_description: "日常只交付当前任务及其产物；整目录删除另走完整门禁"
+  default_prompt: "Use $shoukou to close the current task. You must try to save independently attributable changes, including mixed-file hunks using a temporary Git index that preserves the user's real index. Preserve other tasks' files and index. Verify all requested outcomes: saved, tested, merged, pushed, and deployed, plus original main checkout synchronization and temporary-output disposition when required. A clean release checkout does not replace original-main synchronization. Trace deployed sources and patches to saved versions and check restart dependencies before cleanup. Continue resolvable work under existing authorization; stop only the affected items at evidence-backed boundaries and report partial completion. Never expand to whole-project cleanup unless explicitly requested."
