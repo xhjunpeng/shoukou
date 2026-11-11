@@ -197,6 +197,49 @@ def classify(names, rules):
     return matched
 
 
+def lifecycle_owner_updates(repo, review):
+    """Return only exact, current source versions already accounted by lifecycle."""
+    task = review.get('lifecycle_task')
+    if not task:
+        return {}
+    try:
+        import task_guard
+        repo = Path(repo).resolve()
+        with task_guard.store(repo, task) as (_, path):
+            state = task_guard.regular_json(path)
+        if not {'commit', 'local-main'} <= set(state['requirements']):
+            return {}
+        checked = task_guard.check_task(repo, task, phase='final')
+        if checked.get('state') != 'complete':
+            return {}
+        cfg, _ = task_guard.config_of(repo)
+        updates, snapshots = {}, {}
+        for accepted in checked['accepted_decisions']:
+            key, decision = accepted['object'], accepted['decision']
+            if decision['kind'] != 'owner-update' or not key.startswith('protected-change:'):
+                continue
+            tree, name = key.removeprefix('protected-change:').split(':', 1)
+            if tree not in snapshots:
+                snapshots[tree] = task_guard.source_snapshot(Path(tree), cfg)
+            original = state['baseline']['worktrees'][tree]['changes'].get(name)
+            current = snapshots[tree]['changes'].get(name)
+            if not current or current['working'].get('type') != 'file':
+                continue
+            facts = {'before': original, 'after': current}
+            if task_guard.digest([task, key, facts]) != decision['version']:
+                continue
+            path = Path(tree) / name
+            info = path.lstat()
+            if (task_guard.signature(path) != current['working']
+                    or path.lstat() != info):
+                continue
+            updates[str(path)] = [info.st_mode, info.st_size, info.st_mtime_ns,
+                                  info.st_dev, info.st_ino, info.st_blocks * 512]
+        return updates
+    except (ImportError, OSError, ValueError, KeyError, TypeError):
+        return {}
+
+
 def verify(repo, review):
     started = time.time()
     if not isinstance(review, dict):
@@ -237,7 +280,9 @@ def verify(repo, review):
                   for path in sorted(missing)]
     failures, pending, results, replacements, root_results = [], [], [], [], []
     dynamic_files, dynamic_observations = {}, []
+    owner_updates = lifecycle_owner_updates(repo, review)
     current_roots = [measure(root) for root in roots]
+    accounted_owner_updates = []
     for path in live_paths:
         if not any(path.is_relative_to(p) for p in roots):
             pending.append('new-storage-root-not-reviewed:' + str(path))
@@ -313,7 +358,10 @@ def verify(repo, review):
                         if new_row is None or stat.S_IFMT(old_row[0]) != stat.S_IFMT(new_row[0]):
                             failures.append(str(root / p) + ':protected-entry-missing-or-type-changed')
                         elif not dynamic_ok and not stat.S_ISDIR(old_row[0]) and old_row[:3] != new_row[:3]:
-                            pending.append(str(root / p) + ':protected-material-changed')
+                            if owner_updates.get(str(root / p)) == new_row:
+                                accounted_owner_updates.append(str(root / p))
+                            else:
+                                pending.append(str(root / p) + ':protected-material-changed')
                 if kind == 'git-metadata':
                     git_path = root / name.rstrip('/')
                     # Only actual administrative paths get mutable membership;
@@ -403,6 +451,7 @@ def verify(repo, review):
             'allocated_bytes_decrease': before['totals']['allocated_bytes'] - after_totals['allocated_bytes'],
             'groups': results, 'roots': root_results, 'filesystems': volumes,
             'failures': failures, 'pending': pending, 'dynamic_observations': dynamic_observations,
+            'accounted_owner_updates': accounted_owner_updates,
             'execution': progress.from_checks(pending, failures, review['before_sha256'], review.get('stops')),
             'measurement_note': before['measurement_note'],
             'boundary': 'Declarations are not authenticated. No deletion or service action executed. Compare filesystem available space separately; copies, clones and other writers affect it.'}

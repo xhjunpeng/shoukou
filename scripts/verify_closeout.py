@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only final reconciliation of a closeout ledger with live Git state.
+"""Final reconciliation of a closeout ledger with live Git state.
 
 This verifies outcomes, not cleanup authorization or app occupancy.
 """
@@ -183,6 +183,24 @@ def retained_branch_review(repo, ledger, declaration, name, location, base_head,
             'dependency': dependency, 'blocker': blocker if retention == 'blocked' else None}, failures
 
 
+def protected_main_accounted(repo, main, ledger):
+    """Only a complete persisted lifecycle may account for other-task changes."""
+    task = ledger.get('lifecycle_task')
+    if not task:
+        return False
+    try:
+        import task_guard
+        with task_guard.store(Path(repo).resolve(), task) as (_, path):
+            state = task_guard.regular_json(path)
+        if not {'commit', 'local-main'} <= set(state['requirements']):
+            return False
+        result = task_guard.check_task(Path(repo).resolve(), task, phase='final')
+        return (result.get('state') == 'complete'
+                and Path(result['original_main']).resolve() == Path(main).resolve())
+    except (ImportError, OSError, ValueError, KeyError, TypeError):
+        return False
+
+
 def verify(repo, ledger):
     repo = Path(git_state.value(repo, 'rev-parse', '--show-toplevel')).resolve()
     if not isinstance(ledger, dict) or ledger.get('schema_version') not in (1, 2):
@@ -221,7 +239,8 @@ def verify(repo, ledger):
     else:
         if main_entry['HEAD'] != base_head:
             failures.append('local-main-not-synchronized')
-        if git_state.git(main, 'status', '--porcelain=v1', '-z', '--untracked-files=all'):
+        if (git_state.git(main, 'status', '--porcelain=v1', '-z', '--untracked-files=all')
+                and not protected_main_accounted(repo, main, ledger)):
             failures.append('main-has-unaccounted-changes')
     candidates = ledger['candidates']
     names = [c['branch'] for c in candidates]
@@ -311,7 +330,7 @@ def verify(repo, ledger):
             'live_remote_main': live_remote.get(branch), 'refs': results,
             'runtime': runtime, 'branch_changes': changes,
             'failures': failures, 'pending': pending, 'execution': execution,
-            'boundary': 'Live outcome verification only. Ledger reasons are caller declarations; no authorization, acceptance or app occupancy authenticated. No mutation executed.'}
+            'boundary': 'Live outcome verification. Optional lifecycle checks update only their own observation records. No source, reference or business data mutation. Ledger reasons do not authenticate authorization, acceptance or app occupancy.'}
 
 
 def main():
