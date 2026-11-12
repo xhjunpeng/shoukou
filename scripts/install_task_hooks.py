@@ -11,12 +11,15 @@ import sys
 import time
 import os
 import fcntl
+import tempfile
 import manage_task_hooks as management
 
 sys.dont_write_bytecode = True
 import task_guard as guard
 
 HERE = Path(__file__).resolve().parent
+RUNTIME_FILES = ('task_hooks.py', 'task_guard.py', 'closeout_progress.py',
+                 'readonly_query.py', 'manage_task_hooks.py')
 REQUIRED = {
     'test_omitted_checker_is_automatically_called_and_leaks_force_continuation',
     'test_small_edit_cannot_start_heavy_suite',
@@ -38,6 +41,45 @@ REQUIRED = {
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def freeze_runtime(home, report):
+    """Copy exactly the accepted bytes; never import or overwrite a dev checkout."""
+    payload = {}
+    for name in RUNTIME_FILES:
+        path = guard.no_links(HERE / name)
+        data = path.read_bytes()
+        guard.require(hashlib.sha256(data).hexdigest() == report['candidates'].get(str(path)),
+                      'Accepted runtime source changed: ' + name)
+        payload[name] = data
+    hashes = {name: hashlib.sha256(data).hexdigest() for name, data in payload.items()}
+    version = hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()
+    manifest = {'format': 'codex-task-hook-runtime-v1', 'version': version, 'files': hashes}
+    parent = guard.no_links(Path(home) / 'task-hooks/releases')
+    parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    target = guard.no_links(parent / version)
+    if target.exists():
+        guard.require(target.is_dir() and {p.name for p in target.iterdir()} == set(RUNTIME_FILES) | {'RUNTIME.json'},
+                      'Existing runtime contains unknown files; nothing overwritten')
+        guard.require(guard.regular_json(target / 'RUNTIME.json') == manifest
+                      and all(digest(guard.no_links(target / n)) == h for n, h in hashes.items()),
+                      'Existing frozen runtime changed; nothing overwritten')
+        return target
+    temporary = Path(tempfile.mkdtemp(prefix='.runtime-', dir=parent))
+    try:
+        for name, data in payload.items():
+            file = temporary / name
+            file.write_bytes(data); file.chmod(0o444)
+        guard.atomic(temporary / 'RUNTIME.json', manifest)
+        (temporary / 'RUNTIME.json').chmod(0o444)
+        guard.require(not target.exists() and not target.is_symlink(), 'Runtime appeared concurrently')
+        temporary.rename(target)
+        target.chmod(0o555)
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+    guard.require(all(digest(target / n) == h for n, h in hashes.items()), 'Frozen copy does not match acceptance')
+    return target
 
 
 def validation(path, expected_sha, repo):
@@ -80,6 +122,20 @@ def validation(path, expected_sha, repo):
                   and all(x.get('result', {}).get('state') != 'complete'
                           and x.get('result', {}).get('reconciled_run_resources') == [] for x in checks),
                   'Missing core counterexample: unknown process group must remain unfinished')
+    for name in ['test_development_edits_do_not_change_frozen_checks',
+                 'test_global_management_alias_is_synchronous_with_frozen_runtime']:
+        case = cases.get(name, {})
+        guard.require(case.get('status') == 'passed' and case.get('native')
+                      and all(x.get('exit_code') == 0 and x.get('request_count', 0) > 0 for x in case['native']),
+                      'Missing frozen-runtime native counterexample: ' + name)
+    tamper = cases.get('test_frozen_core_is_checked_before_import', {})
+    guard.require(tamper.get('status') == 'passed' and tamper.get('native')
+                  and all(x.get('exit_code') == 0 and x.get('request_count') == 0 for x in tamper['native'])
+                  and (tamper.get('core') or {}).get('bootstrap_denial', {}).get('permissionDecision') == 'deny',
+                  'Missing pre-import rejection and actual native pre-model rejection')
+    for name in ['test_freeze_requires_exact_accepted_bytes_and_never_overwrites_existing_release',
+                 'test_restore_rejects_unknown_runtime_member_but_uninstall_remains_safe']:
+        guard.require(cases.get(name, {}).get('status') == 'passed', 'Missing immutable runtime safety check: ' + name)
     engine = guard.no_links(Path(report['engine']).resolve())
     version = subprocess.check_output([str(engine), '--version'], text=True, timeout=10).strip()
     guard.require(version == report.get('engine_version'), 'Native engine changed since acceptance')
@@ -106,21 +162,26 @@ def _install(home, repo, report_path, report_sha, promote=False):
                         else management.definitions(old_receipt, previous, global_file.read_bytes() if global_file.exists() else None))
     guard.require(isinstance(previous, dict) and isinstance(previous.get('hooks', {}), dict), 'Existing hook configuration is not an object')
     base = home / 'task-hooks'; guard.no_links(base); base.mkdir(mode=0o700, parents=True, exist_ok=True)
-    state = base / 'sessions'; handler = HERE / 'task_hooks.py'
-    pinned = [{'path': str(HERE / name), 'sha256': digest(HERE / name)}
-              for name in ['task_hooks.py', 'task_guard.py', 'closeout_progress.py', 'readonly_query.py', 'manage_task_hooks.py']]
+    state = base / 'sessions'
+    runtime = freeze_runtime(home, report)
+    handler = runtime / 'task_hooks.py'
+    pinned = [{'path': str(runtime / name), 'sha256': digest(runtime / name)} for name in RUNTIME_FILES]
     settings = {'schema_version': 1, 'scope': 'configured' if promote else 'pilot',
                 'pilot_roots': [str(repo)], 'heavy_tests': ['ai'], 'pinned_files': pinned,
                 'protected_files': [str(global_file), str(home / 'config.toml')],
                 'validation': {'path': str(report_path), 'sha256': report_sha,
                                'engine_version': report['engine_version']}}
+    settings['runtime_release'] = str(runtime)
+    settings['runtime_manifest_sha256'] = digest(runtime / 'RUNTIME.json')
+    settings['management_entry'] = {'path': str(home / 'skills/shoukou/scripts/manage_task_hooks.py'),
+                                    'sha256': digest(runtime / 'manage_task_hooks.py')}
     content = (json.dumps(settings, ensure_ascii=True, indent=2) + '\n').encode()
     policy_hash = hashlib.sha256(content).hexdigest()
     policies = base / 'policies'; guard.no_links(policies); policies.mkdir(mode=0o700, exist_ok=True)
     policy = policies / (policy_hash + '.json')
     python = shutil.which('python3')
     guard.require(python is not None, 'Python interpreter missing')
-    cmd = shlex.join([python, '-B', str(handler), '--policy', str(policy),
+    cmd = shlex.join([python, '-I', '-B', str(handler), '--policy', str(policy),
                       '--policy-sha256', policy_hash, '--state-root', str(state)])
     owned_groups = {}
     old_events = previous.setdefault('hooks', {})
@@ -151,6 +212,9 @@ def _install(home, repo, report_path, report_sha, promote=False):
                'policy': str(policy), 'policy_sha256': digest(policy), 'pinned_files': pinned,
                'validation': settings['validation'], 'scope': settings['scope'],
                'activation': 'awaiting-native-review', 'managed_groups': owned_groups,
+               'runtime_release': str(runtime),
+               'runtime_manifest': {'path': str(runtime / 'RUNTIME.json'),
+                                    'sha256': digest(runtime / 'RUNTIME.json')},
                'boundary': 'No trust store, sandbox permissions, repository protections, production credentials or other task results were modified. Ordinary user hooks require Codex review; this is not an OS enforcement boundary.'}
     guard.atomic(base / 'installation.json', receipt)
     if state_file.exists():

@@ -18,8 +18,70 @@ import subprocess
 import sys
 import time
 import uuid
+import stat
 
 sys.dont_write_bytecode = True
+
+
+def bootstrap_integrity():
+    """Use stdlib only until all runtime dependencies have been checked."""
+    cli = argparse.ArgumentParser(add_help=False)
+    cli.add_argument('--policy', required=True)
+    cli.add_argument('--policy-sha256')
+    args, _ = cli.parse_known_args()
+
+    def file(path):
+        path = Path(os.path.abspath(path))
+        if any(p.is_symlink() for p in [path, *path.parents]):
+            raise ValueError('Symbolic link in runtime policy or source')
+        if not stat.S_ISREG(path.stat().st_mode) or path.stat().st_size > MAX_BOOT_FILE:
+            raise ValueError('Runtime policy/source is not a bounded regular file')
+        return path.read_bytes()
+
+    data = file(args.policy)
+    if args.policy_sha256 and hashlib.sha256(data).hexdigest() != args.policy_sha256:
+        raise ValueError('Policy hash mismatch')
+    policy = json.loads(data)
+    pins = policy.get('pinned_files', [])
+    for pin in pins:
+        if hashlib.sha256(file(pin['path'])).hexdigest() != pin['sha256']:
+            raise ValueError('Protected hook/checker changed; review the exact new version before continuing')
+    if policy.get('runtime_release'):
+        root = Path(policy['runtime_release'])
+        names = {'task_hooks.py', 'task_guard.py', 'closeout_progress.py', 'readonly_query.py', 'manage_task_hooks.py'}
+        raw_manifest = file(root / 'RUNTIME.json')
+        manifest = json.loads(raw_manifest)
+        expected = {str(root / n): manifest.get('files', {}).get(n) for n in names}
+        actual = {p['path']: p['sha256'] for p in pins}
+        if (hashlib.sha256(raw_manifest).hexdigest() != policy.get('runtime_manifest_sha256')
+                or manifest.get('format') != 'codex-task-hook-runtime-v1' or actual != expected
+                or manifest.get('version') != root.name
+                or {p.name for p in root.iterdir()} != names | {'RUNTIME.json'}
+                or Path(__file__).absolute().parent != root):
+            raise ValueError('Frozen runtime manifest or dependency set changed')
+
+
+MAX_BOOT_FILE = 2 * 1024 * 1024
+if __name__ == '__main__':
+    try:
+        bootstrap_integrity()
+    except (ValueError, OSError, KeyError, TypeError) as error:
+        try:
+            event = json.load(sys.stdin) if not sys.stdin.isatty() else {}
+        except (ValueError, OSError):
+            event = {}
+        reason = '自动检查执行失败，不能当作通过：' + str(error)
+        if event.get('hook_event_name') == 'PreToolUse':
+            print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse',
+                  'permissionDecision': 'deny', 'permissionDecisionReason': reason}}, ensure_ascii=False))
+            raise SystemExit(0)
+        if event.get('hook_event_name') == 'Stop':
+            print(json.dumps({'continue': False, 'stopReason': reason}, ensure_ascii=False))
+            raise SystemExit(0)
+        print(reason, file=sys.stderr)
+        raise SystemExit(2)
+    # -I keeps workspace/PYTHONPATH modules out of the trusted bootstrap.
+    sys.path.insert(0, str(Path(__file__).absolute().parent))
 import task_guard as guard
 from readonly_query import readonly_command, segments
 import manage_task_hooks as management
@@ -349,7 +411,12 @@ class Hooks:
                 return {'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'allow',
                                               'updatedInput': dict(data, command=readonly)}}
         manager_path = Path(__file__).with_name('manage_task_hooks.py').resolve()
-        if is_shell and len(args) >= 3 and Path(shutil.which(args[0]) or '/nonexistent-python').resolve() == Path(sys.executable).resolve() and args[1] == '-B' and args[2] == str(manager_path) and segments(command) and len(segments(command)) == 1:
+        alias = self.policy.get('management_entry', {})
+        manager_paths = {str(manager_path), alias.get('path')}
+        if is_shell and len(args) >= 3 and Path(shutil.which(args[0]) or '/nonexistent-python').resolve() == Path(sys.executable).resolve() and args[1] == '-B' and args[2] in manager_paths and segments(command) and len(segments(command)) == 1:
+            if args[2] == alias.get('path') and (not Path(args[2]).is_file()
+                    or sha(guard.no_links(Path(args[2]))) != alias.get('sha256')):
+                return deny('共用管理命令版本已变化；请使用安装回执中的固定管理入口。普通检查仍使用已验收版本。')
             # Control operations execute synchronously, like init/bind. Removing
             # PostToolUse must not strand the control command in pending_tools.
             cli = argparse.ArgumentParser(add_help=False)

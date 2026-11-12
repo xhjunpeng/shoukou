@@ -23,6 +23,7 @@ from test_task_hooks import HookAdapterTests
 from test_task_hooks_native import NativeHookTests
 from test_task_guard import TaskGuardTests
 from test_hook_management import ReadonlyQueries, ManagementTests, NativeQueries
+from test_frozen_runtime import FrozenRuntimeTests
 
 
 def protected_snapshot(repo):
@@ -123,7 +124,7 @@ def candidates():
             ROOT / 'tests/test_task_hooks.py', ROOT / 'tests/test_task_hooks_native.py',
             ROOT / 'tests/hook_native_probe.py', ROOT / 'tests/test_task_guard.py', ROOT / 'scripts/readonly_query.py',
             ROOT / 'scripts/manage_task_hooks.py', ROOT / 'scripts/install_task_hooks.py',
-            ROOT / 'tests/test_hook_management.py', Path(__file__).resolve()]
+            ROOT / 'tests/test_hook_management.py', ROOT / 'tests/test_frozen_runtime.py', Path(__file__).resolve()]
 
 
 def fingerprints():
@@ -152,6 +153,7 @@ def validate(repo, output):
                                loader.loadTestsFromTestCase(ReadonlyQueries),
                                loader.loadTestsFromTestCase(ManagementTests),
                                loader.loadTestsFromTestCase(NativeQueries),
+                               loader.loadTestsFromTestCase(FrozenRuntimeTests),
                                TaskGuardTests('test_unknown_process_group_never_completes_reclaimed_interruption')])
     outcome = unittest.TextTestRunner(verbosity=2, resultclass=Result).run(suite)
     report = {'format': 'codex-task-hooks-validation-v1', 'repo': str(repo), 'engine': str(ENGINE),

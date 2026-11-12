@@ -92,6 +92,20 @@ def verify_version(receipt):
         require(digest(safe(entry['path']).read_bytes()) == entry['sha256'], 'Source changed; reinstall after acceptance')
     evidence = receipt['validation']
     require(digest(safe(evidence['path']).read_bytes()) == evidence['sha256'], 'Acceptance evidence changed')
+    manifest = receipt.get('runtime_manifest')
+    if manifest:
+        manifest_path = safe(manifest['path'])
+        require(digest(manifest_path.read_bytes()) == manifest['sha256'],
+                'Frozen runtime manifest changed; reinstall after acceptance')
+        root = manifest_path.parent
+        names = {'task_hooks.py', 'task_guard.py', 'closeout_progress.py', 'readonly_query.py', 'manage_task_hooks.py'}
+        content = read(manifest_path)
+        expected = {str(root / name): content.get('files', {}).get(name) for name in names}
+        actual = {item['path']: item['sha256'] for item in receipt['pinned_files']}
+        require(manifest_path.name == 'RUNTIME.json' and content.get('format') == 'codex-task-hook-runtime-v1'
+                and content.get('version') == root.name and actual == expected
+                and {p.name for p in root.iterdir()} == names | {'RUNTIME.json'},
+                'Frozen runtime dependency set changed; nothing restored')
 
 
 def _manage(home, action='status', apply=False):
