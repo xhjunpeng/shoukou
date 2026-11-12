@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from test_task_hooks import HookFixture, SCRIPTS, EVENTS
-from hook_native_probe import native_run, command, message, ENGINE
+from hook_native_probe import native_run, native_hook_list, command, message, ENGINE
 import install_task_hooks as installer
 import manage_task_hooks as manager
 
@@ -70,12 +70,21 @@ class FrozenRuntimeTests(unittest.TestCase):
             bad['hooks'][event][0]['hooks'][0]['additionalContextLimit'] = 800
         before = self.f.protected()
         config_path.write_text(json.dumps(bad))
-        rejected_options = native_run(home, self.f.repo, [message('只读查询结束。')], prompt='只读查看，不修改文件。')
-        self.assertEqual(rejected_options['exit'], 0, rejected_options['stderr'])
+        rejected_options = native_hook_list(home, self.f.repo)
+        self.core_evidence = {'unsupported_options': rejected_options}
+        self.assertEqual(rejected_options['exit_code'], 0, rejected_options['stderr'])
+        warnings = json.dumps(rejected_options['listing'])
         for event in ['Stop', 'Interrupt']:
-            self.assertIn('ignoring additionalContextLimit for ' + event + ' hook', rejected_options['stderr'])
-        self.core_evidence = {'unsupported_options': self.evidence(rejected_options, {})}
+            self.assertIn('ignoring additionalContextLimit for ' + event + ' hook', warnings)
         config_path.write_bytes(accepted)
+        loaded = native_hook_list(home, self.f.repo)
+        self.core_evidence['installed_options'] = loaded
+        self.assertEqual(loaded['exit_code'], 0, loaded['stderr'])
+        self.assertEqual(len(loaded['listing']['data']), 1)
+        group = loaded['listing']['data'][0]
+        self.assertEqual(group['warnings'], [])
+        self.assertEqual(group['errors'], [])
+        self.assertEqual(len(group['hooks']), 5)
         result = native_run(home, self.f.repo,
                             [command("rg -n 'task|other' other.txt | head -n 2"), message('只读查询结束。')],
                             prompt='只读查看，不修改文件。')

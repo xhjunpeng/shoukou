@@ -10,8 +10,65 @@ import os
 from pathlib import Path
 import subprocess
 import threading
+import queue
+import tempfile
 
 ENGINE = Path('/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex')
+
+
+def native_hook_list(home, repo, timeout=15):
+    """Ask the desktop engine's settings loader; this never trusts or runs hooks."""
+    env = dict(os.environ, CODEX_HOME=str(home), DO_NOT_TRACK='1')
+    for key in list(env):
+        if key.endswith(('API_KEY', 'AUTH_TOKEN')) or key.startswith('OPENAI_'):
+            env.pop(key, None)
+    args = [str(ENGINE), '--no-daemon', '-c', 'features.plugins=false', '-c', 'features.apps=false',
+            '-c', 'features.memories=false', 'app-server', '--stdio']
+    with tempfile.TemporaryFile() as errors:
+        process = subprocess.Popen(args, cwd=repo, env=env, stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=errors, text=True)
+        lines = queue.Queue()
+        def read():
+            try:
+                for line in process.stdout:
+                    lines.put(line)
+            finally:
+                lines.put(None)
+        reader = threading.Thread(target=read, daemon=True); reader.start()
+        def send(value):
+            process.stdin.write(json.dumps(value) + '\n'); process.stdin.flush()
+        def response(identity):
+            while True:
+                line = lines.get(timeout=timeout)
+                if line is None:
+                    raise RuntimeError('Native settings loader exited before replying')
+                value = json.loads(line)
+                if value.get('id') == identity:
+                    if 'error' in value:
+                        raise RuntimeError(json.dumps(value['error']))
+                    return value['result']
+        try:
+            send({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {
+                'clientInfo': {'name': 'hook-config-validation', 'version': '1'},
+                'capabilities': {'experimentalApi': True}}})
+            response(1)
+            send({'jsonrpc': '2.0', 'method': 'initialized'})
+            send({'jsonrpc': '2.0', 'id': 2, 'method': 'hooks/list', 'params': {'cwds': [str(repo)]}})
+            listing = response(2)
+        finally:
+            process.stdin.close()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill(); process.wait(timeout=5)
+            reader.join(timeout=2); process.stdout.close()
+        errors.seek(0)
+        return {'engine': str(ENGINE), 'exit_code': process.returncode,
+                'listing': listing, 'stderr': errors.read().decode(errors='replace')}
 
 
 def native_run(home, repo, outputs, prompt='Edit the fixture as requested.', timeout=60, sandbox='workspace-write', model='fixture-model'):
