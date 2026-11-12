@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Read-only final checks for one explicitly selected daily closeout task.
+"""Final checks for one explicitly selected daily closeout task.
 
-Only declared paths and refs are checked. Scope completeness, user authority and
-original evidence truth are not authenticated. No cleanup permission is granted.
+Declared paths and refs are checked. Integrated repositories must additionally
+pass the shared task guard, which discovers changes from a persisted baseline.
+Source, index and refs are never mutated. The task guard refreshes its own
+metadata. User authority and original evidence truth are not authenticated.
 """
 import argparse
 import hashlib
@@ -86,6 +88,21 @@ def _registered(repo, path, branch):
     return False
 
 
+def _lifecycle_required(repo):
+    config = repo / '.codex/workflow.json'
+    if config.exists() or config.is_symlink():
+        return True
+    # Removing a config must not silently downgrade an adopted repository to
+    # the old declared-list checker. Check only this repository's own metadata.
+    tracked = _git(repo, 'ls-files', '-z', '--', '.codex/workflow.json').stdout
+    if tracked:
+        return True
+    states = _common(repo) / 'codex-workflow'
+    if states.is_symlink():
+        return True
+    return states.is_dir() and any(states.glob('*.json'))
+
+
 def _file(path):
     if path.is_symlink() or not path.is_file():
         raise ValueError('Declared file is missing, non-regular or a symlink')
@@ -96,7 +113,8 @@ def _file(path):
 def _validate(plan):
     _object(plan, {'schema_version', 'task', 'repo', 'saved_commit', 'target_ref',
                    'requirements', 'local_main', 'sources', 'restart_dependencies',
-                   'remote_target', 'cleanup_has_services', 'evidence', 'stops'},
+                   'remote_target', 'cleanup_has_services', 'evidence', 'stops',
+                   'lifecycle_task'},
             ('schema_version', 'task', 'repo', 'saved_commit', 'target_ref', 'requirements'))
     if plan['schema_version'] != 1 or not _text(plan['task']):
         raise ValueError('Expected schema_version 1 and a named task')
@@ -110,6 +128,9 @@ def _validate(plan):
             or len(set(requirements)) != len(requirements)):
         raise ValueError('requirements must name unique supported requirements from the user request')
     _absolute(plan['repo'])
+    if 'lifecycle_task' in plan and (not isinstance(plan['lifecycle_task'], str)
+            or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}', plan['lifecycle_task'])):
+        raise ValueError('lifecycle_task must identify one exact persisted task')
     if 'local_main' in plan:
         item = _object(plan['local_main'], {'path', 'branch'}, ('path', 'branch'))
         _absolute(item['path'])
@@ -267,6 +288,27 @@ def verify(plan):
         before['local_main'] = [head, branch]
         final['local_main'] = [_revision(path, 'HEAD'), _value(path, 'branch', '--show-current')]
     record('git-state-stable', before == final, {'before': before, 'after': final})
+    # A hand-written list cannot replace the development baseline in projects
+    # that have adopted the shared workflow. Never guess the latest task.
+    if _lifecycle_required(repo) or 'lifecycle_task' in plan:
+        task = plan.get('lifecycle_task')
+        facts = {'task': task}
+        passed = False
+        if task:
+            result = subprocess.run(
+                [sys.executable, '-B', str(Path(__file__).with_name('task_guard.py')),
+                 '--repo', str(repo), 'check', '--task', task, '--phase', 'final'],
+                capture_output=True, text=True, timeout=120,
+                env=dict(os.environ, GIT_TERMINAL_PROMPT='0'))
+            facts['exit'] = result.returncode
+            try:
+                facts['result'] = json.loads(result.stdout)
+                passed = result.returncode == 0 and facts['result'].get('state') == 'complete'
+            except (ValueError, TypeError):
+                facts['reason'] = 'Task guard returned no valid result'
+        else:
+            facts['reason'] = 'Integrated project requires its exact development task; baseline coverage cannot be omitted'
+        record('task-lifecycle', passed, facts)
     execution = assess(pending, plan.get('stops'))
     return {'schema_version': 1, 'mode': 'daily-final', 'task': plan['task'],
             'saved_commit': saved, 'target_ref': plan['target_ref'], 'target_commit': target,
@@ -276,7 +318,7 @@ def verify(plan):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--input', required=True, help='Exact task plan JSON; no scripts are executed')
+    parser.add_argument('--input', required=True, help='Exact task plan JSON; no project test or deployment commands are executed')
     parser.add_argument('--json', action='store_true')
     args = parser.parse_args(argv)
     try:

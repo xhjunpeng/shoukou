@@ -83,6 +83,36 @@ class DailyCloseoutTest(unittest.TestCase):
         self.assertIn('git-state-stable', {check['object'] for check in result['checks']})
         self.assertIn('Omitted sources', result['boundary'])
 
+    def test_integrated_project_cannot_omit_development_baseline(self):
+        config = self.repo / '.codex/workflow.json'
+        config.parent.mkdir()
+        config.write_text(json.dumps({'schema_version': 1, 'main_branch': 'main',
+                                     'remote': 'origin', 'output_roots': [], 'tests': {}}))
+        before = self.git('status', '--porcelain=v1', '-uall')
+        result = self.verify()
+        self.assertEqual(result['state'], 'continue')
+        self.assertIn('task-lifecycle', self.failed(result))
+        self.assertEqual(self.git('status', '--porcelain=v1', '-uall'), before)
+
+    def test_nonexistent_lifecycle_task_does_not_pass(self):
+        self.plan['lifecycle_task'] = 'missing-task'
+        result = self.verify()
+        self.assertEqual(result['state'], 'continue')
+        self.assertIn('task-lifecycle', self.failed(result))
+
+    def test_removing_config_cannot_downgrade_integrated_project(self):
+        config = self.repo / '.codex/workflow.json'
+        config.parent.mkdir()
+        config.write_text(json.dumps({'schema_version': 1, 'main_branch': 'main',
+                                     'remote': 'origin', 'output_roots': ['.runtime'], 'tests': {}}))
+        subprocess.run([sys.executable, '-B', str(SCRIPT.with_name('task_guard.py')),
+                        '--repo', str(self.repo), 'begin', '--task', 'existing-task',
+                        '--require', 'cleanup'], check=True, capture_output=True)
+        config.unlink()
+        result = self.verify()
+        self.assertEqual(result['state'], 'continue')
+        self.assertIn('task-lifecycle', self.failed(result))
+
     def test_clean_published_worktree_cannot_hide_unsynchronized_original_main(self):
         published, saved = self.published_version()
         self.plan.update(repo=str(published), saved_commit=saved,
