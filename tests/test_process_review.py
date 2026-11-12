@@ -141,7 +141,10 @@ class ProcessReviewTests(unittest.TestCase):
         meta = json.loads(metadata); meta['source'] = str(fake); self.source.write_text(json.dumps(meta))
         with self.assertRaisesRegex(ValueError, 'not pinned'): self.review()
         self.source.write_text('['*2000+'0'+']'*2000)
-        with self.assertRaisesRegex(ValueError, 'nested too deeply'): self.review()
+        with self.assertRaises(ValueError): self.review()
+        self.source.write_bytes(metadata)
+        with patch.object(manager.json, 'loads', side_effect=RecursionError('decoder exhausted')):
+            with self.assertRaisesRegex(ValueError, 'nested too deeply'): self.review()
         self.assertEqual(self.state['command_failures'], self.original_facts)
 
     def test_bad_ps_results_and_unknown_resources_do_not_get_review(self):
