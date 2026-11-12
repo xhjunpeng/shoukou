@@ -12,6 +12,7 @@ import subprocess
 import threading
 import queue
 import tempfile
+import time
 
 ENGINE = Path('/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex')
 
@@ -27,6 +28,7 @@ def native_hook_list(home, repo, timeout=15):
     with tempfile.TemporaryFile() as errors:
         process = subprocess.Popen(args, cwd=repo, env=env, stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=errors, text=True)
+        deadline = time.monotonic() + timeout
         lines = queue.Queue()
         def read():
             try:
@@ -39,7 +41,10 @@ def native_hook_list(home, repo, timeout=15):
             process.stdin.write(json.dumps(value) + '\n'); process.stdin.flush()
         def response(identity):
             while True:
-                line = lines.get(timeout=timeout)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError('Native settings loader response deadline exceeded')
+                line = lines.get(timeout=remaining)
                 if line is None:
                     raise RuntimeError('Native settings loader exited before replying')
                 value = json.loads(line)
@@ -56,7 +61,10 @@ def native_hook_list(home, repo, timeout=15):
             send({'jsonrpc': '2.0', 'id': 2, 'method': 'hooks/list', 'params': {'cwds': [str(repo)]}})
             listing = response(2)
         finally:
-            process.stdin.close()
+            try:
+                process.stdin.close()
+            except OSError:
+                pass  # Reaping the child must still run after a broken input pipe.
             try:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
