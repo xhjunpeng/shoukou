@@ -1,6 +1,8 @@
 """Recognize bounded read-only queries; never authorize arbitrary Python."""
 import ast
 import builtins
+import copy
+from collections import Counter
 import re
 import shlex
 import shutil
@@ -9,8 +11,8 @@ from pathlib import Path
 
 READ = {'pwd', 'ls', 'cat', 'rg', 'head', 'tail', 'wc', 'which', 'true', 'printf'}
 GIT = {'status', 'diff', 'log', 'show', 'ls-files', 'ls-tree', 'rev-parse', 'show-ref', 'for-each-ref', 'merge-base'}
-CALLS = {'Path', 'print', 'str', 'len', 'list', 'dict', 'all', 'any', 'sorted', 'tuple', 'set', 'int', 'bool'}
-ATTRS = {'read_text', 'read_bytes', 'exists', 'is_file', 'is_dir', 'glob', 'rglob', 'get', 'items', 'values', 'keys', 'loads', 'dumps', 'sha256', 'hexdigest', 'join', 'name', 'parent', 'stem', 'suffix', 'parts'}
+CALLS = {'Path', 'print', 'str', 'len', 'list', 'dict', 'all', 'any', 'sorted', 'tuple', 'set', 'int', 'bool', 'isinstance'}
+ATTRS = {'read_text', 'read_bytes', 'exists', 'is_file', 'is_dir', 'is_symlink', 'glob', 'rglob', 'iterdir', 'stat', 'st_size', 'get', 'items', 'values', 'keys', 'loads', 'dumps', 'sha256', 'hexdigest', 'join', 'name', 'parent', 'stem', 'suffix', 'parts'}
 
 
 def query_python(command):
@@ -71,6 +73,77 @@ def query_python(command):
                 return None
     # -I prevents local json.py / PYTHONPATH from turning a read into execution.
     return shlex.join([args[0], '-I', '-B', '-c', source])
+
+
+def diagnostic_correction(original, corrected):
+    """Admit only additional JSON-object guards; preserve all query work.
+
+    Both commands must be in the isolated read-only subset. This first version
+    deliberately does not decide whether arbitrary rewritten code is equivalent.
+    """
+    before, after = query_python(original), query_python(corrected)
+    if before is None or after is None:
+        raise ValueError('Both diagnostic commands must be bounded read-only Python queries')
+
+    def strip_guards(tree):
+        guards = Counter()
+        sites = []
+        def visit(node, path=()):
+            for field, value in ast.iter_fields(node):
+                if isinstance(value, list):
+                    kept = []; previous = None
+                    for child in value:
+                        variable = None
+                        if (isinstance(node, ast.For) and field == 'body'
+                                and isinstance(child, ast.If) and not child.orelse
+                                and len(child.body) == 1 and isinstance(child.body[0], ast.Continue)
+                                and isinstance(child.test, ast.UnaryOp) and isinstance(child.test.op, ast.Not)):
+                            call = child.test.operand
+                            if (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                                    and call.func.id == 'isinstance' and not call.keywords and len(call.args) == 2
+                                    and isinstance(call.args[0], ast.Name) and isinstance(call.args[1], ast.Name)
+                                    and call.args[1].id == 'dict'):
+                                variable = call.args[0].id
+                        if (variable and isinstance(previous, ast.Assign) and len(previous.targets) == 1
+                                and isinstance(previous.targets[0], ast.Name) and previous.targets[0].id == variable
+                                and isinstance(previous.value, ast.Call) and isinstance(previous.value.func, ast.Attribute)
+                                and isinstance(previous.value.func.value, ast.Name)
+                                and previous.value.func.value.id == 'json' and previous.value.func.attr == 'loads'
+                                and len(previous.value.args) == 1 and not previous.value.keywords
+                                and isinstance(previous.value.args[0], ast.Call)
+                                and isinstance(previous.value.args[0].func, ast.Attribute)
+                                and previous.value.args[0].func.attr == 'read_text'
+                                and isinstance(previous.value.args[0].func.value, ast.Name)
+                                and isinstance(node.target, ast.Name)
+                                and node.target.id == previous.value.args[0].func.value.id):
+                            guards[(path, len(kept), variable)] += 1
+                            sites.append({'key': (path, len(kept), variable), 'line': child.lineno,
+                                          'record': variable, 'input': node.target.id})
+                            continue
+                        if isinstance(child, ast.AST):
+                            visit(child, path + (field, len(kept)))
+                        kept.append(child); previous = child
+                    setattr(node, field, kept)
+                elif isinstance(value, ast.AST):
+                    visit(value, path + (field,))
+            return node
+        return ast.dump(visit(copy.deepcopy(tree)), include_attributes=False), guards, sites
+
+    original_tree = ast.parse(shlex.split(before)[-1])
+    corrected_tree = ast.parse(shlex.split(after)[-1])
+    if any(isinstance(node, ast.Assert) for tree in [original_tree, corrected_tree] for node in ast.walk(tree)):
+        raise ValueError('Assertion-bearing verification is not a reviewable diagnostic query')
+    left, old_guards, _ = strip_guards(original_tree)
+    right, new_guards, sites = strip_guards(corrected_tree)
+    if (left != right or old_guards - new_guards or not new_guards - old_guards):
+        raise ValueError('Correction must only add JSON-object guards without changing reads, output or query scope')
+    added = new_guards - old_guards
+    selected = []
+    for site in reversed(sites):
+        if added[site['key']]:
+            added[site['key']] -= 1
+            selected.append({k: v for k, v in site.items() if k != 'key'})
+    return {'argv': shlex.split(after), 'kind': 'json-object-guard', 'sites': selected}
 
 
 def segments(command):

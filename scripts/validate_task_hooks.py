@@ -24,6 +24,8 @@ from test_task_hooks_native import NativeHookTests
 from test_task_guard import TaskGuardTests
 from test_hook_management import ReadonlyQueries, ManagementTests, NativeQueries
 from test_frozen_runtime import FrozenRuntimeTests
+from test_diagnostic_review import DiagnosticReviewTests, CapturedDiagnosticTest
+from test_reviewed_invocation_receipts import ReviewedInvocationTests
 
 
 def protected_snapshot(repo):
@@ -124,15 +126,22 @@ def candidates():
             ROOT / 'tests/test_task_hooks.py', ROOT / 'tests/test_task_hooks_native.py',
             ROOT / 'tests/hook_native_probe.py', ROOT / 'tests/test_task_guard.py', ROOT / 'scripts/readonly_query.py',
             ROOT / 'scripts/manage_task_hooks.py', ROOT / 'scripts/install_task_hooks.py',
-            ROOT / 'tests/test_hook_management.py', ROOT / 'tests/test_frozen_runtime.py', Path(__file__).resolve()]
+            ROOT / 'tests/test_hook_management.py', ROOT / 'tests/test_frozen_runtime.py',
+            ROOT / 'tests/test_diagnostic_review.py', ROOT / 'tests/test_reviewed_invocation_receipts.py', Path(__file__).resolve()]
 
 
 def fingerprints():
     return {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in candidates()}
 
 
-def validate(repo, output):
+def validate(repo, output, diagnostic_evidence=None):
     initial = fingerprints()
+    captured_files = {}
+    if diagnostic_evidence:
+        folder = guard.no_links(Path(diagnostic_evidence).absolute())
+        for name in ['SOURCE.json', 'original-command.txt', 'corrected-command.txt', 'original-invocation.jsonl', 'original-result.jsonl']:
+            file = guard.no_links(folder / name)
+            captured_files[str(file)] = hashlib.sha256(file.read_bytes()).hexdigest()
     class Result(unittest.TextTestResult):
         cases = []
         def addSuccess(self, test):
@@ -146,6 +155,8 @@ def validate(repo, output):
             super().addError(test, err)
             self.cases.append({'name': test.id(), 'status': 'error', 'native': getattr(test, 'native_evidence', [])})
     LiveFoundationTest.repo = str(repo)
+    CapturedDiagnosticTest.repo = repo
+    CapturedDiagnosticTest.evidence = diagnostic_evidence
     loader = unittest.defaultTestLoader
     suite = unittest.TestSuite([loader.loadTestsFromTestCase(HookAdapterTests),
                                loader.loadTestsFromTestCase(NativeHookTests),
@@ -154,13 +165,18 @@ def validate(repo, output):
                                loader.loadTestsFromTestCase(ManagementTests),
                                loader.loadTestsFromTestCase(NativeQueries),
                                loader.loadTestsFromTestCase(FrozenRuntimeTests),
+                               loader.loadTestsFromTestCase(DiagnosticReviewTests),
+                               loader.loadTestsFromTestCase(CapturedDiagnosticTest),
+                               loader.loadTestsFromTestCase(ReviewedInvocationTests),
                                TaskGuardTests('test_unknown_process_group_never_completes_reclaimed_interruption')])
     outcome = unittest.TextTestRunner(verbosity=2, resultclass=Result).run(suite)
+    captured_stable = all(hashlib.sha256(Path(path).read_bytes()).hexdigest() == sha for path, sha in captured_files.items())
     report = {'format': 'codex-task-hooks-validation-v1', 'repo': str(repo), 'engine': str(ENGINE),
               'engine_version': subprocess.check_output([str(ENGINE), '--version'], text=True).strip(),
-              'created_at': time.time(), 'candidates': initial, 'candidate_stable': initial == fingerprints(),
+              'created_at': time.time(), 'candidates': initial, 'candidate_stable': initial == fingerprints() and captured_stable,
+              'diagnostic_evidence': captured_files,
               'tests_run': outcome.testsRun, 'cases': outcome.cases,
-              'exit_code': 0 if outcome.wasSuccessful() and initial == fingerprints() else 1,
+              'exit_code': 0 if outcome.wasSuccessful() and initial == fingerprints() and captured_stable else 1,
               'scope': 'Isolated local provider and actual desktop-bundled engine; no paid API or production use. Hook trust bypass is confined to these vetted temporary fixtures, never global configuration.'}
     guard.atomic(Path(output), report)
     return report
@@ -169,7 +185,8 @@ def validate(repo, output):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--repo', required=True); parser.add_argument('--output', required=True)
+    parser.add_argument('--diagnostic-evidence')
     args = parser.parse_args()
-    result = validate(guard.root_of(args.repo), Path(args.output).absolute())
+    result = validate(guard.root_of(args.repo), Path(args.output).absolute(), args.diagnostic_evidence)
     print(json.dumps({'exit_code': result['exit_code'], 'tests_run': result['tests_run'], 'report': str(Path(args.output).absolute())}))
     raise SystemExit(result['exit_code'])

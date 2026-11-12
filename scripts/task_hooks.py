@@ -231,6 +231,7 @@ class Hooks:
                     raise ValueError('Existing task belongs to another checkout')
                 state.update(task=bound, task_started=True, requirements=original['requirements'])
             self.verify_integrity()
+            state['policy_sha256'] = sha(self.policy_path)
             output = self.dispatch(event, repo, state)
             state['events'].append({'event': name, 'tool': event.get('tool_name'),
                                     'tool_use_id': event.get('tool_use_id'),
@@ -360,7 +361,8 @@ class Hooks:
         if name == 'PostToolUse':
             pending = state['pending_tools'].pop(event.get('tool_use_id', ''), None)
             if pending:
-                state['mutations'] += 1
+                if not pending.get('read_only'):
+                    state['mutations'] += 1
                 state['owned_paths'] = sorted(set(state['owned_paths']) | set(pending['paths']))
                 state['last_audit'] = None
                 if any(p not in state.get('initial_dirty', []) for p in changed_paths(repo)):
@@ -375,6 +377,11 @@ class Hooks:
                     matches = re.findall(re.escape(pending['exit_marker']) + r':([0-9]+)(?:\s|$)', response)
                     code = int(matches[-1]) if matches else None
                     failures = state.setdefault('command_failures', {})
+                    history = state.setdefault('command_failure_history', [])
+                    old = failures.get(pending['command_key'])
+                    if old is not None and not any(x.get('command_key') == pending['command_key'] and x.get('facts') == old for x in history):
+                        if len(history) >= 128: raise ValueError('Failure history limit reached; preserve and review existing records')
+                        history.append({'command_key': pending['command_key'], 'facts': old.copy()})
                     if code == 0:
                         failures.pop(pending['command_key'], None)
                     else:
@@ -406,6 +413,8 @@ class Hooks:
         if is_shell:
             readonly = readonly_command(command)
             if readonly is not None:
+                if guard.digest(command) in state.get('command_failures', {}):
+                    return self.wrap_shell(event, state, readonly, command, read_only=True)
                 if readonly == command:
                     return {}
                 return {'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'allow',
@@ -419,15 +428,22 @@ class Hooks:
                 return deny('共用管理命令版本已变化；请使用安装回执中的固定管理入口。普通检查仍使用已验收版本。')
             # Control operations execute synchronously, like init/bind. Removing
             # PostToolUse must not strand the control command in pending_tools.
-            cli = argparse.ArgumentParser(add_help=False)
-            cli.add_argument('--home', default=str(self.policy_path.parent.parent.parent))
-            cli.add_argument('action', choices=['status', 'disable', 'enable', 'uninstall', 'recover'])
-            cli.add_argument('--apply', action='store_true')
+            cli = management.parser(add_help=False)
             try:
                 control = cli.parse_args(args[3:])
             except SystemExit:
                 return deny('管理入口参数无效；未停用检查。')
-            result = management.manage(control.home, control.action, control.apply)
+            if control.action == 'review-diagnostic':
+                if Path(control.home).absolute() != self.policy_path.parent.parent.parent:
+                    return deny('诊断复核不能指定其他安装目录。')
+                key = guard.digest([str(repo), state['session_id']])[:32]
+                try:
+                    result = management.review_diagnostic(guard, repo, state, control,
+                        lambda: guard.atomic(self.state_root / (key + '.json'), state))
+                except (ValueError, OSError, KeyError, TypeError) as error:
+                    return deny('诊断复核未通过，原始失败保留：' + str(error))
+            else:
+                result = management.manage(control.home, control.action, control.apply)
             output = shlex.join(['printf', '%s\n', json.dumps(result, ensure_ascii=False)])
             return {'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'allow',
                                           'updatedInput': dict(data, command=output)}}
@@ -515,19 +531,20 @@ class Hooks:
         else:
             command_to_run = command
         if is_shell:
-            # Codex's native PostToolUse Bash payload contains output without a
-            # structured exit code. A per-call marker records the actual child
-            # result; missing/truncated output remains unknown, never green.
-            marker = '__CODEX_TASK_EXIT_' + uuid.uuid4().hex + '__'
-            state['pending_tools'][event.get('tool_use_id', '')].update(
-                exit_marker=marker, command_key=guard.digest(command))
-            wrapped = '(\n' + command_to_run + '\n)\ncodex_task_exit=$?\nprintf "\\n' + marker + ':%s\\n" "$codex_task_exit"\nexit "$codex_task_exit"'
-            return {'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'allow',
-                                          'updatedInput': dict(data, command=wrapped)}}
+            return self.wrap_shell(event, state, command_to_run, command)
         return context('PreToolUse', '已自动记录本任务基线；轻检查通过。未运行任何测试。')
 
+    def wrap_shell(self, event, state, command_to_run, original, read_only=False):
+        marker = '__CODEX_TASK_EXIT_' + uuid.uuid4().hex + '__'
+        state['pending_tools'].setdefault(event.get('tool_use_id', ''), {'paths': []}).update(
+            exit_marker=marker, command_key=guard.digest(original), read_only=read_only)
+        wrapped = '(\n' + command_to_run + '\n)\ncodex_task_exit=$?\nprintf "\\n' + marker + ':%s\\n" "$codex_task_exit"\nexit "$codex_task_exit"'
+        return {'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'allow',
+                                      'updatedInput': dict(event['tool_input'], command=wrapped)}}
+
     def stop(self, event, repo, state):
-        if not state['task_started'] or state.get('paused') or (not state['mutations'] and not state.get('turn_closeout') and not state['pending_tools']):
+        if not state['task_started'] or state.get('paused') or (not state['mutations'] and not state.get('turn_closeout')
+                and not state['pending_tools'] and not state.get('command_failures') and not state.get('diagnostic_attempts')):
             return {}
         self.extend(repo, state)
         result = guard.check_task(repo, state['task'])
@@ -538,8 +555,10 @@ class Hooks:
         failed = [x for x in all_pending if x not in deferred]
         if state.get('resume_binding_required'):
             failed.append({'object': 'existing-task-binding-required', 'version': guard.digest(state['resume_candidates'])})
+        reviewed = management.reviewed_diagnostics(guard, repo, state, result['candidate'])
         failed.extend({'object': 'command:' + key, 'version': guard.digest(facts)}
-                      for key, facts in state.get('command_failures', {}).items())
+                      for key, facts in state.get('command_failures', {}).items() if key not in reviewed)
+        failed.extend(management.diagnostic_resources(guard, state))
         if state['pending_tools']:
             failed.append({'object': 'native-tools-not-finished', 'version': guard.digest(state['pending_tools'])})
         current = guard.regular_json(guard.common_of(repo) / 'codex-workflow' / (state['task'] + '.json'))
@@ -565,9 +584,12 @@ class Hooks:
         state['last_audit'] = {'candidate': result['candidate'], 'unfinished': [x['object'] for x in failed],
                                'machine_checks_complete': not failed, 'tests_auto_started': 0,
                                'deferred_closeout': [x['object'] for x in deferred],
+                               'reviewed_diagnostic_failures': sorted(reviewed),
                                'phase': 'closeout' if state.get('turn_closeout') else 'draft'}
         if not failed:
             state['stop_retries'] = 0
+            state['last_successful_audit'] = dict(state['last_audit'], policy_sha256=state['policy_sha256'])
+            management.record_stop_observation(self.policy_path.parent.parent.parent, state['policy_sha256'], state)
             return {}
         state['stop_retries'] = state.get('stop_retries', 0) + 1
         summary = '；'.join(x['object'] for x in failed[:8])

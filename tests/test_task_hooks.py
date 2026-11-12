@@ -103,6 +103,17 @@ class HookFixture:
                         assert [root.stat().st_dev, root.stat().st_ino] == run['root_identity']
                         assert guard.group_active(run.get('pgid')) is False
                         shutil.rmtree(root)
+        if self.state.exists():
+            for file in self.state.glob('*.json'):
+                record = json.loads(file.read_text())
+                for attempt in record.get('diagnostic_attempts', []):
+                    root = Path(attempt['root'])
+                    if root.exists() and not root.is_relative_to(self.root):
+                        assert attempt['repo'] == str(self.repo)
+                        assert root.name.startswith('codex-task-guard-')
+                        assert [root.stat().st_dev, root.stat().st_ino] == attempt['root_identity']
+                        assert guard.group_active(attempt['pgid']) is False
+                        shutil.rmtree(root)
         self.temp.cleanup()
         assert not self.root.exists()
 

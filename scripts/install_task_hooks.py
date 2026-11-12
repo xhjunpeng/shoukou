@@ -88,6 +88,12 @@ def validation(path, expected_sha, repo):
     guard.require(report.get('format') == 'codex-task-hooks-validation-v1'
                   and report.get('repo') == str(repo) and report.get('exit_code') == 0
                   and report.get('candidate_stable') is True, 'Native acceptance did not pass for this exact repository/version')
+    captured = report.get('diagnostic_evidence', {})
+    guard.require({Path(file).name for file in captured} == {'SOURCE.json', 'original-command.txt', 'corrected-command.txt',
+                  'original-invocation.jsonl', 'original-result.jsonl'} and len(captured) == 5,
+                  'Exact captured diagnostic evidence required')
+    for file, value in captured.items():
+        guard.require(digest(guard.no_links(Path(file))) == value, 'Captured diagnostic evidence changed')
     for file, value in report.get('candidates', {}).items():
         guard.require(digest(guard.no_links(Path(file))) == value, 'Validated candidate changed: ' + file)
     required_sources = {str(HERE / f) for f in ['task_hooks.py', 'task_guard.py', 'closeout_progress.py']}
@@ -137,6 +143,35 @@ def validation(path, expected_sha, repo):
     for name in ['test_freeze_requires_exact_accepted_bytes_and_never_overwrites_existing_release',
                  'test_restore_rejects_unknown_runtime_member_but_uninstall_remains_safe']:
         guard.require(cases.get(name, {}).get('status') == 'passed', 'Missing immutable runtime safety check: ' + name)
+    for name in ['test_json_list_diagnostic_correction_preserves_failure_and_reports_skips',
+                 'test_changed_query_wrong_guard_and_writes_cannot_be_reviewed', 'test_all_records_skipped_is_not_success',
+                 'test_unrelated_success_and_preview_do_not_resolve_failure',
+                 'test_review_is_idempotent_and_bound_to_original_state_and_evidence',
+                 'test_wrong_task_or_original_text_cannot_start_review',
+                 'test_timeout_and_log_overflow_preserve_failure_and_reclaim_owned_work',
+                 'test_concurrent_source_change_or_changed_failure_rejects_review',
+                 'test_checkpoint_interruption_reaps_owned_child_without_claiming_success',
+                 'test_candidate_change_before_runner_does_not_register_a_rejected_review',
+                 'test_unknown_attempt_resources_and_other_failures_still_block_stop']:
+        guard.require(cases.get(name, {}).get('status') == 'passed', 'Missing diagnostic review counterexample: ' + name)
+    for name in ['test_explicit_review_records_original_failure_without_rewriting_it',
+                 'test_named_test_failure_cannot_be_reviewed_as_an_invocation',
+                 'test_review_does_not_survive_a_later_candidate_change',
+                 'test_stale_candidate_receipt_does_not_clear_new_failure',
+                 'test_valid_json_outside_this_task_is_not_a_run_receipt']:
+        guard.require(cases.get(name, {}).get('status') == 'passed', 'Missing published core receipt counterexample: ' + name)
+    native_review = cases.get('test_native_legacy_diagnostic_review_allows_stop_without_erasing_failure', {})
+    guard.require(native_review.get('status') == 'passed' and native_review.get('native')
+                  and all(x.get('exit_code') == 0 and x.get('request_count', 0) > 0
+                          and x.get('control', {}).get('last_audit', {}).get('machine_checks_complete') is True
+                          and x.get('control', {}).get('command_failures') for x in native_review['native']),
+                  'Missing native diagnostic migration, retained failure and Stop audit')
+    actual = cases.get('test_captured_actual_readonly_failure_and_corrected_inputs', {})
+    facts = actual.get('core') or {}
+    guard.require(actual.get('status') == 'passed' and facts.get('original_exit_code') == 1
+                  and facts.get('original_failure_preserved') is True and facts.get('actual_project_and_failure_unchanged') is True
+                  and facts.get('review', {}).get('observed_objects', 0) > 0 and facts.get('review', {}).get('skipped_inputs'),
+                  'Actual captured read-only diagnostic was not verified without changing the project or original failure')
     engine = guard.no_links(Path(report['engine']).resolve())
     version = subprocess.check_output([str(engine), '--version'], text=True, timeout=10).strip()
     guard.require(version == report.get('engine_version'), 'Native engine changed since acceptance')
