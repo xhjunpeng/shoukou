@@ -362,7 +362,7 @@ def verify_diagnostic_resource(core, state, attempt):
             and attempt['session_id'] == state['session_id'], 'Diagnostic owner changed')
     require(attempt.get('status') in {'complete', 'interrupted'} and type(attempt.get('exit_code')) is int
             and type(attempt.get('pgid')) is int and attempt['pgid'] > 0
-            and core.group_active(attempt['pgid']) is False and not work.exists()
+            and core.run_group_active(attempt) is False and not work.exists()
             and attempt.get('work_reclaimed') is True and core.evidence_ok(attempt.get('receipt')),
             'Diagnostic execution or cleanup is unfinished')
     evidence = safe(root / 'evidence')
@@ -404,7 +404,7 @@ def reviewed_diagnostics(core, repo, state, candidate):
                     and attempt['candidate'] == candidate and attempt['status'] == 'complete'
                     and attempt['exit_code'] == 0 and not attempt['violations'] and attempt['work_reclaimed']
                     and type(attempt['pgid']) is int and attempt['pgid'] > 0
-                    and core.group_active(attempt['pgid']) is False and core.evidence_ok(attempt['receipt']),
+                    and core.run_group_active(attempt) is False and core.evidence_ok(attempt['receipt']),
                     'Diagnostic execution receipt is not successful for this candidate')
             bound = ['repo', 'session_id', 'task', 'policy_sha256', 'candidate', 'failed_command',
                      'failure_facts', 'failure_version', 'files', 'kind', 'reason', 'corrected_sha256']

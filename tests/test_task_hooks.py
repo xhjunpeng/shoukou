@@ -112,7 +112,7 @@ class HookFixture:
                         assert attempt['repo'] == str(self.repo)
                         assert root.name.startswith('codex-task-guard-')
                         assert [root.stat().st_dev, root.stat().st_ino] == attempt['root_identity']
-                        assert guard.group_active(attempt['pgid']) is False
+                        assert guard.run_group_active(attempt) is False
                         shutil.rmtree(root)
         self.temp.cleanup()
         assert not self.root.exists()

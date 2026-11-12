@@ -94,6 +94,12 @@ def validation(path, expected_sha, repo):
                   'Exact captured diagnostic evidence required')
     for file, value in captured.items():
         guard.require(digest(guard.no_links(Path(file))) == value, 'Captured diagnostic evidence changed')
+    resources = report.get('resource_evidence', {})
+    guard.require({Path(file).name for file in resources} == {'SOURCE.json', 'original-record.json',
+                  'original-result.json', 'current-group-observation.json'} and len(resources) == 4,
+                  'Exact captured run-resource evidence required')
+    for file, value in resources.items():
+        guard.require(digest(guard.no_links(Path(file))) == value, 'Captured run-resource evidence changed')
     for file, value in report.get('candidates', {}).items():
         guard.require(digest(guard.no_links(Path(file))) == value, 'Validated candidate changed: ' + file)
     required_sources = {str(HERE / f) for f in ['task_hooks.py', 'task_guard.py', 'closeout_progress.py']}
@@ -172,6 +178,22 @@ def validation(path, expected_sha, repo):
                   and facts.get('original_failure_preserved') is True and facts.get('actual_project_and_failure_unchanged') is True
                   and facts.get('review', {}).get('observed_objects', 0) > 0 and facts.get('review', {}).get('skipped_inputs'),
                   'Actual captured read-only diagnostic was not verified without changing the project or original failure')
+    for name in ['test_terminal_receipt_closes_exact_run_despite_reused_group',
+                 'test_closed_resource_does_not_turn_nonzero_execution_green',
+                 'test_missing_drifted_receipt_unknown_group_or_reappeared_work_is_not_terminal',
+                 'test_active_or_unknown_descendants_cannot_use_terminal_receipt',
+                 'test_reclaimed_interruption_requires_same_current_successful_replay',
+                 'test_live_parent_remaining_work_or_changed_identity_prevents_reconciliation',
+                 'test_reclaim_rejects_unknown_active_tampered_or_replaced_resources',
+                 'test_force_killed_observer_leaves_work_and_pending_run_resources']:
+        guard.require(cases.get(name, {}).get('status') == 'passed', 'Missing run-resource counterexample: ' + name)
+    resource = cases.get('test_actual_completed_047_resource_is_not_the_reused_system_group', {})
+    facts = resource.get('core') or {}
+    guard.require(resource.get('status') == 'passed' and facts.get('original_exit_code') == 0
+                  and facts.get('owned_run_active') is False and facts.get('work_absent') is True
+                  and all(facts.get(name) is True for name in ['original_receipt_unchanged',
+                      'original_record_unchanged', 'project_source_unchanged']),
+                  'Actual completed run and retained original receipt must be verified without process control')
     engine = guard.no_links(Path(report['engine']).resolve())
     version = subprocess.check_output([str(engine), '--version'], text=True, timeout=10).strip()
     guard.require(version == report.get('engine_version'), 'Native engine changed since acceptance')

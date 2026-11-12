@@ -318,6 +318,45 @@ def group_active(group):
                for parts in (line.split() for line in p.stdout.splitlines()))
 
 
+def run_group_active(entry):
+    """Observe this run, not a later process that reused its numeric PGID.
+
+    A sealed terminal observation is scoped to the exact run and resource
+    identities. It never turns a failed execution into a successful test and
+    never authorizes killing a current process or deleting a directory.
+    """
+    if not isinstance(entry, dict) or type(entry.get('pgid')) is not int or entry['pgid'] <= 0:
+        return None
+    try:
+        root = no_links(Path(entry['root']))
+        work = no_links(root / 'work')
+        receipt = entry.get('receipt')
+        path = no_links(root / 'evidence/result.json')
+        require(root.is_absolute() and root.name.startswith('codex-task-guard-') and root.is_dir()
+                and [root.stat().st_dev, root.stat().st_ino] == entry['root_identity'], 'Run resource identity changed')
+        require(not work.exists() and not work.is_symlink() and {p.name for p in root.iterdir()} == {'evidence'},
+                'Run work or unknown output remains')
+        require(isinstance(receipt, dict) and Path(receipt.get('path', '')) == path
+                and path.is_file() and 0 < path.stat().st_size <= MAX_LOG_BYTES and evidence_ok(receipt),
+                'Terminal run receipt is unavailable')
+        sealed = regular_json(path)
+        require(isinstance(sealed, dict) and sealed.get('status') in {'complete', 'interrupted'}
+                and type(sealed.get('exit_code')) is int and sealed.get('active_descendants') is False
+                and type(sealed.get('pgid')) is int and sealed['pgid'] > 0
+                and type(sealed.get('finished_at')) in (int, float) and sealed['finished_at'] > 0,
+                'No known terminal process observation')
+        require({'root', 'root_identity', 'work_identity', 'pgid', 'status', 'exit_code', 'active_descendants', 'finished_at'} <= set(sealed),
+                'Incomplete terminal run observation')
+        # Reclamation may update only the physical work flag after the sealed
+        # result; the original exit, identities and execution facts stay exact.
+        names = set(sealed) - {'work_reclaimed'}
+        require(digest({k: sealed[k] for k in names}) == digest({k: entry[k] for k in names}),
+                'Terminal receipt no longer matches the run')
+        return False
+    except (ValueError, OSError, KeyError, TypeError):
+        return group_active(entry['pgid'])
+
+
 def runner_active(pid):
     if type(pid) is not int or pid <= 0:
         return None
@@ -528,17 +567,17 @@ def check_task(repo, task, phase='final', decision_paths=(), stop_paths=()):
         for key, run in failures.items():
             named = run.get('test') or key in {digest(argv) for argv in cfg.get('tests', {}).values()}
             reviewable = (not named and run.get('status') == 'complete'
-                          and group_active(run.get('pgid')) is False
+                          and run_group_active(run) is False
                           and not (Path(run['root']) / 'work').exists()
                           and not (Path(run['root']) / 'work').is_symlink()
                           and evidence_ok(run.get('receipt')))
             finding('run:' + key, {'run_id': run['id'], 'candidate': candidate, 'status': run['status'], 'exit_code': run.get('exit_code'),
-                    'violations': run.get('violations'), 'group_active_now': group_active(run.get('pgid'))},
+                    'violations': run.get('violations'), 'run_active_now': run_group_active(run)},
                     ('reviewed-invocation',) if reviewable else ())
         if 'cleanup' in state['requirements']:
             for position, run in enumerate(state['runs']):
                 run_root = Path(run['root'])
-                active = group_active(run.get('pgid'))
+                active = run_group_active(run)
                 replay = next((item for item in reversed(state['runs'][position + 1:])
                                if item['command_key'] == run['command_key']), {})
                 if (type(run.get('pgid')) is int and run['pgid'] > 0
@@ -553,8 +592,8 @@ def check_task(repo, task, phase='final', decision_paths=(), stop_paths=()):
                                        'retained_evidence': str(run_root / 'evidence')})
                     continue
                 if run.get('status') != 'complete' or active is not False:
-                    finding('run-resource:' + run['id'], {'status': run['status'], 'active_group': active, 'root': str(run_root)})
-                elif (run_root / 'work').exists():
+                    finding('run-resource:' + run['id'], {'status': run['status'], 'run_active': active, 'root': str(run_root)})
+                elif (run_root / 'work').exists() or (run_root / 'work').is_symlink():
                     finding('run-work:' + run['id'], {'root': str(run_root), 'status': run['status']}, ('retained-output',))
         if phase == 'final':
             head = current['worktrees'][str(repo)]['head']
@@ -598,7 +637,7 @@ def check_task(repo, task, phase='final', decision_paths=(), stop_paths=()):
                     proof = next((r for r in state['runs'] if r.get('receipt') == item['evidence']
                                   and r.get('candidate') == candidate and r.get('status') == 'complete'
                                   and r.get('exit_code') == 0 and not r.get('violations')
-                                  and group_active(r.get('pgid')) is False), None)
+                                  and run_group_active(r) is False), None)
                     require(proof is not None, 'Review requires a valid successful run of this task and current candidate')
                     if item['kind'] == 'reviewed-invocation':
                         original = failures.get(item['object'].removeprefix('run:'))

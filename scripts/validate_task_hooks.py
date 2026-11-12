@@ -26,6 +26,7 @@ from test_hook_management import ReadonlyQueries, ManagementTests, NativeQueries
 from test_frozen_runtime import FrozenRuntimeTests
 from test_diagnostic_review import DiagnosticReviewTests, CapturedDiagnosticTest
 from test_reviewed_invocation_receipts import ReviewedInvocationTests
+from test_run_resource_identity import RunResourceIdentityTests, CapturedRunResourceTest
 
 
 def protected_snapshot(repo):
@@ -127,14 +128,14 @@ def candidates():
             ROOT / 'tests/hook_native_probe.py', ROOT / 'tests/test_task_guard.py', ROOT / 'scripts/readonly_query.py',
             ROOT / 'scripts/manage_task_hooks.py', ROOT / 'scripts/install_task_hooks.py',
             ROOT / 'tests/test_hook_management.py', ROOT / 'tests/test_frozen_runtime.py',
-            ROOT / 'tests/test_diagnostic_review.py', ROOT / 'tests/test_reviewed_invocation_receipts.py', Path(__file__).resolve()]
+            ROOT / 'tests/test_diagnostic_review.py', ROOT / 'tests/test_run_resource_identity.py', ROOT / 'tests/test_reviewed_invocation_receipts.py', Path(__file__).resolve()]
 
 
 def fingerprints():
     return {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in candidates()}
 
 
-def validate(repo, output, diagnostic_evidence=None):
+def validate(repo, output, diagnostic_evidence=None, resource_evidence=None):
     initial = fingerprints()
     captured_files = {}
     if diagnostic_evidence:
@@ -142,6 +143,12 @@ def validate(repo, output, diagnostic_evidence=None):
         for name in ['SOURCE.json', 'original-command.txt', 'corrected-command.txt', 'original-invocation.jsonl', 'original-result.jsonl']:
             file = guard.no_links(folder / name)
             captured_files[str(file)] = hashlib.sha256(file.read_bytes()).hexdigest()
+    resource_files = {}
+    if resource_evidence:
+        folder = guard.no_links(Path(resource_evidence).absolute())
+        for name in ['SOURCE.json', 'original-record.json', 'original-result.json', 'current-group-observation.json']:
+            file = guard.no_links(folder / name)
+            resource_files[str(file)] = hashlib.sha256(file.read_bytes()).hexdigest()
     class Result(unittest.TextTestResult):
         cases = []
         def addSuccess(self, test):
@@ -157,6 +164,8 @@ def validate(repo, output, diagnostic_evidence=None):
     LiveFoundationTest.repo = str(repo)
     CapturedDiagnosticTest.repo = repo
     CapturedDiagnosticTest.evidence = diagnostic_evidence
+    CapturedRunResourceTest.repo = repo
+    CapturedRunResourceTest.evidence = resource_evidence
     loader = unittest.defaultTestLoader
     suite = unittest.TestSuite([loader.loadTestsFromTestCase(HookAdapterTests),
                                loader.loadTestsFromTestCase(NativeHookTests),
@@ -168,13 +177,20 @@ def validate(repo, output, diagnostic_evidence=None):
                                loader.loadTestsFromTestCase(DiagnosticReviewTests),
                                loader.loadTestsFromTestCase(CapturedDiagnosticTest),
                                loader.loadTestsFromTestCase(ReviewedInvocationTests),
-                               TaskGuardTests('test_unknown_process_group_never_completes_reclaimed_interruption')])
+                               loader.loadTestsFromTestCase(RunResourceIdentityTests),
+                               loader.loadTestsFromTestCase(CapturedRunResourceTest),
+                               *[TaskGuardTests(name) for name in [
+                                   'test_unknown_process_group_never_completes_reclaimed_interruption',
+                                   'test_reclaimed_interruption_requires_same_current_successful_replay',
+                                   'test_live_parent_remaining_work_or_changed_identity_prevents_reconciliation',
+                                   'test_reclaim_rejects_unknown_active_tampered_or_replaced_resources',
+                                   'test_force_killed_observer_leaves_work_and_pending_run_resources']]])
     outcome = unittest.TextTestRunner(verbosity=2, resultclass=Result).run(suite)
-    captured_stable = all(hashlib.sha256(Path(path).read_bytes()).hexdigest() == sha for path, sha in captured_files.items())
+    captured_stable = all(hashlib.sha256(Path(path).read_bytes()).hexdigest() == sha for path, sha in {**captured_files, **resource_files}.items())
     report = {'format': 'codex-task-hooks-validation-v1', 'repo': str(repo), 'engine': str(ENGINE),
               'engine_version': subprocess.check_output([str(ENGINE), '--version'], text=True).strip(),
               'created_at': time.time(), 'candidates': initial, 'candidate_stable': initial == fingerprints() and captured_stable,
-              'diagnostic_evidence': captured_files,
+              'diagnostic_evidence': captured_files, 'resource_evidence': resource_files,
               'tests_run': outcome.testsRun, 'cases': outcome.cases,
               'exit_code': 0 if outcome.wasSuccessful() and initial == fingerprints() and captured_stable else 1,
               'scope': 'Isolated local provider and actual desktop-bundled engine; no paid API or production use. Hook trust bypass is confined to these vetted temporary fixtures, never global configuration.'}
@@ -186,7 +202,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--repo', required=True); parser.add_argument('--output', required=True)
     parser.add_argument('--diagnostic-evidence')
+    parser.add_argument('--resource-evidence')
     args = parser.parse_args()
-    result = validate(guard.root_of(args.repo), Path(args.output).absolute(), args.diagnostic_evidence)
+    result = validate(guard.root_of(args.repo), Path(args.output).absolute(), args.diagnostic_evidence, args.resource_evidence)
     print(json.dumps({'exit_code': result['exit_code'], 'tests_run': result['tests_run'], 'report': str(Path(args.output).absolute())}))
     raise SystemExit(result['exit_code'])

@@ -51,7 +51,7 @@ class TaskGuardTests(unittest.TestCase):
                     continue
                 for run in json.loads(path.read_text()).get('runs', []):
                     root = Path(run['root'])
-                    if run.get('pgid') and guard.group_active(run['pgid']):
+                    if guard.run_group_active(run) is True:
                         try:
                             os.killpg(run['pgid'], signal.SIGKILL)
                         except ProcessLookupError:
