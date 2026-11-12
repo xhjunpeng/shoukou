@@ -53,6 +53,46 @@ class FrozenRuntimeTests(unittest.TestCase):
                 'request_count': result['request_count'], 'stdout': result['stdout'],
                 'stderr': result['stderr'], 'control': control}
 
+    @unittest.skipUnless(ENGINE.is_file(), 'Desktop engine unavailable')
+    def test_installed_definitions_load_without_context_warnings(self):
+        home = self.f.root / 'installed-home'; home.mkdir()
+        report_path = self.f.root / 'accepted-report.json'
+        self.report['engine_version'] = subprocess.check_output([str(ENGINE), '--version'], text=True).strip()
+        report_path.write_text(json.dumps(self.report))
+        with patch.object(installer, 'HERE', self.editable), patch.object(installer, 'validation', return_value=self.report):
+            receipt = installer._install(home, self.f.repo, report_path, installer.digest(report_path))
+        self.addCleanup(Path(receipt['runtime_release']).chmod, 0o700)
+        config_path = home / 'hooks.json'
+        accepted = config_path.read_bytes()
+        good = json.loads(accepted)
+        bad = copy.deepcopy(good)
+        for event in ['Stop', 'Interrupt']:
+            bad['hooks'][event][0]['hooks'][0]['additionalContextLimit'] = 800
+        before = self.f.protected()
+        config_path.write_text(json.dumps(bad))
+        rejected_options = native_run(home, self.f.repo, [message('只读查询结束。')], prompt='只读查看，不修改文件。')
+        self.assertEqual(rejected_options['exit'], 0, rejected_options['stderr'])
+        for event in ['Stop', 'Interrupt']:
+            self.assertIn('ignoring additionalContextLimit for ' + event + ' hook', rejected_options['stderr'])
+        self.core_evidence = {'unsupported_options': self.evidence(rejected_options, {})}
+        config_path.write_bytes(accepted)
+        result = native_run(home, self.f.repo,
+                            [command("rg -n 'task|other' other.txt | head -n 2"), message('只读查询结束。')],
+                            prompt='只读查看，不修改文件。')
+        controls = [json.loads(p.read_text()) for p in (home / 'task-hooks/sessions').glob('*.json')]
+        control = controls[-1]
+        self.native_evidence = [self.evidence(result, control)]
+        self.assertEqual(result['exit'], 0, result['stderr'])
+        self.assertNotIn('ignoring additionalContextLimit', result['stderr'])
+        self.assertTrue(result['request_count'])
+        for event in ['Stop', 'Interrupt']:
+            self.assertNotIn('additionalContextLimit', good['hooks'][event][0]['hooks'][0])
+        for event in ['UserPromptSubmit', 'PreToolUse', 'PostToolUse']:
+            self.assertEqual(good['hooks'][event][0]['hooks'][0]['additionalContextLimit'], 800)
+        self.assertTrue(all(x['baseline_captures'] == 0 and not x['task_started'] for x in controls))
+        self.assertEqual(before, self.f.protected())
+        manager.verify_version(receipt)
+
     def test_freeze_requires_exact_accepted_bytes_and_never_overwrites_existing_release(self):
         (self.editable / 'task_guard.py').write_text('unaccepted source')
         with patch.object(installer, 'HERE', self.editable):

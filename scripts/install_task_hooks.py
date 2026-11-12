@@ -123,7 +123,8 @@ def validation(path, expected_sha, repo):
                           and x.get('result', {}).get('reconciled_run_resources') == [] for x in checks),
                   'Missing core counterexample: unknown process group must remain unfinished')
     for name in ['test_development_edits_do_not_change_frozen_checks',
-                 'test_global_management_alias_is_synchronous_with_frozen_runtime']:
+                 'test_global_management_alias_is_synchronous_with_frozen_runtime',
+                 'test_installed_definitions_load_without_context_warnings']:
         case = cases.get(name, {})
         guard.require(case.get('status') == 'passed' and case.get('native')
                       and all(x.get('exit_code') == 0 and x.get('request_count', 0) > 0 for x in case['native']),
@@ -190,7 +191,9 @@ def _install(home, repo, report_path, report_sha, promote=False):
         guard.require(isinstance(groups, list), 'Existing hook group must be a list')
         preserved = [g for g in groups if g not in prior_groups.get(event, [])]
         timeout = 3 if event == 'Interrupt' else (30 if event in ('PreToolUse', 'Stop') else 15)
-        entry = {'type': 'command', 'command': cmd, 'timeout': timeout, 'additionalContextLimit': 800}
+        entry = {'type': 'command', 'command': cmd, 'timeout': timeout}
+        if event in {'UserPromptSubmit', 'PreToolUse', 'PostToolUse'}:
+            entry['additionalContextLimit'] = 800
         managed = {'hooks': [entry]}
         owned_groups[event] = [managed]
         preserved.append(managed)
