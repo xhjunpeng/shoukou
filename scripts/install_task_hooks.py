@@ -178,7 +178,8 @@ def validation(path, expected_sha, repo):
                   and facts.get('original_failure_preserved') is True and facts.get('actual_project_and_failure_unchanged') is True
                   and facts.get('review', {}).get('observed_objects', 0) > 0 and facts.get('review', {}).get('skipped_inputs'),
                   'Actual captured read-only diagnostic was not verified without changing the project or original failure')
-    for name in ['test_terminal_receipt_closes_exact_run_despite_reused_group',
+    for name in ['test_published_invocation_review_version_remains_accepted',
+                 'test_terminal_receipt_closes_exact_run_despite_reused_group',
                  'test_closed_resource_does_not_turn_nonzero_execution_green',
                  'test_missing_drifted_receipt_unknown_group_or_reappeared_work_is_not_terminal',
                  'test_active_or_unknown_descendants_cannot_use_terminal_receipt',

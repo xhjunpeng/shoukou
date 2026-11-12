@@ -572,7 +572,7 @@ def check_task(repo, task, phase='final', decision_paths=(), stop_paths=()):
                           and not (Path(run['root']) / 'work').is_symlink()
                           and evidence_ok(run.get('receipt')))
             finding('run:' + key, {'run_id': run['id'], 'candidate': candidate, 'status': run['status'], 'exit_code': run.get('exit_code'),
-                    'violations': run.get('violations'), 'run_active_now': run_group_active(run)},
+                    'violations': run.get('violations'), 'group_active_now': run_group_active(run)},
                     ('reviewed-invocation',) if reviewable else ())
         if 'cleanup' in state['requirements']:
             for position, run in enumerate(state['runs']):
@@ -592,7 +592,7 @@ def check_task(repo, task, phase='final', decision_paths=(), stop_paths=()):
                                        'retained_evidence': str(run_root / 'evidence')})
                     continue
                 if run.get('status') != 'complete' or active is not False:
-                    finding('run-resource:' + run['id'], {'status': run['status'], 'run_active': active, 'root': str(run_root)})
+                    finding('run-resource:' + run['id'], {'status': run['status'], 'active_group': active, 'root': str(run_root)})
                 elif (run_root / 'work').exists() or (run_root / 'work').is_symlink():
                     finding('run-work:' + run['id'], {'root': str(run_root), 'status': run['status']}, ('retained-output',))
         if phase == 'final':

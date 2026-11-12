@@ -35,6 +35,25 @@ class RunResourceIdentityTests(unittest.TestCase):
             self.assertTrue(any(x['object'].startswith('run:') for x in result['unfinished']))
             self.assertFalse(any(x['object'].startswith('run-resource:') for x in result['unfinished']))
 
+    def test_published_invocation_review_version_remains_accepted(self):
+        failed = self.recorded('raise SystemExit(9)')
+        proof = self.recorded()
+        key = 'run:' + failed['command_key']
+        pending = self.f.check()
+        finding = next(x for x in pending['unfinished'] if x['object'] == key)
+        # The already-published 402/36dc projection is a compatibility contract.
+        facts = {'run_id': failed['id'], 'candidate': pending['candidate'],
+                 'status': failed['status'], 'exit_code': failed['exit_code'],
+                 'violations': failed['violations'], 'group_active_now': False}
+        legacy_version = guard.digest(['task', key, facts])
+        self.assertEqual(finding['version'], legacy_version)
+        decision = dict(object=key, version=legacy_version, kind='reviewed-invocation',
+                        reason='Retain the exact published invocation review projection', evidence=proof['receipt'])
+        path = self.f.base/'published-review.json'; path.write_text(json.dumps(decision))
+        before = copy.deepcopy(self.f.state()['runs'])
+        self.assertEqual(self.f.check(decision_paths=[path])['state'], 'complete')
+        self.assertEqual(self.f.state()['runs'], before)
+
     def test_missing_drifted_receipt_unknown_group_or_reappeared_work_is_not_terminal(self):
         run = self.recorded()
         with patch.object(guard, 'group_active', return_value=True):
