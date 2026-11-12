@@ -526,8 +526,15 @@ def check_task(repo, task, phase='final', decision_paths=(), stop_paths=()):
             else:
                 failures[key] = run
         for key, run in failures.items():
-            finding('run:' + key, {'run_id': run['id'], 'status': run['status'], 'exit_code': run.get('exit_code'),
-                    'violations': run.get('violations'), 'group_active_now': group_active(run.get('pgid'))})
+            named = run.get('test') or key in {digest(argv) for argv in cfg.get('tests', {}).values()}
+            reviewable = (not named and run.get('status') == 'complete'
+                          and group_active(run.get('pgid')) is False
+                          and not (Path(run['root']) / 'work').exists()
+                          and not (Path(run['root']) / 'work').is_symlink()
+                          and evidence_ok(run.get('receipt')))
+            finding('run:' + key, {'run_id': run['id'], 'candidate': candidate, 'status': run['status'], 'exit_code': run.get('exit_code'),
+                    'violations': run.get('violations'), 'group_active_now': group_active(run.get('pgid'))},
+                    ('reviewed-invocation',) if reviewable else ())
         if 'cleanup' in state['requirements']:
             for position, run in enumerate(state['runs']):
                 run_root = Path(run['root'])
@@ -574,7 +581,7 @@ def check_task(repo, task, phase='final', decision_paths=(), stop_paths=()):
                     if digest(argv) not in successes:
                         finding('test:' + name, {'candidate': candidate, 'command_key': digest(argv), 'executable': Path(argv[0]).name}, ('test-record',))
                 if not state.get('selected_tests'):
-                    finding('tests-selection', {'candidate': candidate, 'reason': 'Select relevant tests with begin --test NAME'})
+                    finding('tests-selection', {'candidate': candidate, 'reason': 'Select relevant tests with begin --test NAME or review an exact successful ad-hoc test receipt'}, ('test-record',))
             if 'deploy' in state['requirements']:
                 finding('deploy-record', {'candidate': candidate, 'url': cfg.get('deployment', {}).get('url')}, ('deployment-record',))
         for decision_path in decision_paths:
@@ -584,6 +591,19 @@ def check_task(repo, task, phase='final', decision_paths=(), stop_paths=()):
                 require(set(item) <= {'object', 'version', 'kind', 'reason', 'evidence', 'retention', 'review_event'}, 'Unknown decision fields')
                 require(all(isinstance(item.get(k), str) and item[k].strip() for k in ['object', 'version', 'kind', 'reason']), 'Exact object/version/kind/reason required')
                 require(evidence_ok(item.get('evidence')), 'Original decision evidence must exist and match SHA256')
+                if item['kind'] in ('reviewed-invocation', 'test-record'):
+                    # This is an explicit caller review, never automatic semantic
+                    # equivalence or permission to rewrite a failed run's receipt.
+                    # A free-form JSON success flag or another task cannot supply proof.
+                    proof = next((r for r in state['runs'] if r.get('receipt') == item['evidence']
+                                  and r.get('candidate') == candidate and r.get('status') == 'complete'
+                                  and r.get('exit_code') == 0 and not r.get('violations')
+                                  and group_active(r.get('pgid')) is False), None)
+                    require(proof is not None, 'Review requires a valid successful run of this task and current candidate')
+                    if item['kind'] == 'reviewed-invocation':
+                        original = failures.get(item['object'].removeprefix('run:'))
+                        require(original is not None and proof.get('finished_at', 0) > original.get('finished_at', 0),
+                                'Invocation review requires a later corrected run')
                 if item['kind'] in ('retained-branch', 'retained-output', 'other-task'):
                     require(all(isinstance(item.get(k), str) and item[k].strip() for k in ['retention', 'review_event']), 'Retention purpose and review_event required')
                 state['decisions'].append(item)
