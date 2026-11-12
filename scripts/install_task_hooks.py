@@ -100,6 +100,16 @@ def validation(path, expected_sha, repo):
                   'Exact captured run-resource evidence required')
     for file, value in resources.items():
         guard.require(digest(guard.no_links(Path(file))) == value, 'Captured run-resource evidence changed')
+    processes = report.get('process_evidence', {})
+    guard.require({Path(file).name for file in processes} == {'SOURCE.json', 'original-command.txt',
+                  'original-result.jsonl', 'native-source.json'} and len(processes) == 4,
+                  'Exact captured process-query evidence required')
+    for file, value in processes.items():
+        guard.require(digest(guard.no_links(Path(file))) == value, 'Captured process-query evidence changed')
+    by_name = {Path(file).name: Path(file) for file in processes}
+    process_origins = {guard.digest(by_name['original-command.txt'].read_text()): guard.regular_json(by_name['native-source.json'])}
+    guard.require(guard.digest(report.get('process_origins')) == guard.digest(process_origins),
+                  'Approved native query origins do not match captured acceptance')
     for file, value in report.get('candidates', {}).items():
         guard.require(digest(guard.no_links(Path(file))) == value, 'Validated candidate changed: ' + file)
     required_sources = {str(HERE / f) for f in ['task_hooks.py', 'task_guard.py', 'closeout_progress.py']}
@@ -195,6 +205,28 @@ def validation(path, expected_sha, repo):
                   and all(facts.get(name) is True for name in ['original_receipt_unchanged',
                       'original_record_unchanged', 'project_source_unchanged']),
                   'Actual completed run and retained original receipt must be verified without process control')
+    for name in ['test_empty_ps_query_retains_exit_one_and_original_failure',
+                 'test_current_matching_pid_does_not_claim_original_process_identity',
+                 'test_ps_arguments_writes_and_changed_query_are_not_reviewable',
+                 'test_wrong_native_identity_output_marker_or_journal_never_accepts',
+                 'test_bad_ps_results_and_unknown_resources_do_not_get_review',
+                 'test_ps_review_tampering_policy_or_unrelated_failure_remains_blocking',
+                 'test_ps_timeout_retains_failure_and_reaps_only_owned_child']:
+        guard.require(cases.get(name, {}).get('status') == 'passed', 'Missing process-query counterexample: ' + name)
+    process_native = cases.get('test_native_ps_review_preserves_exit_one_and_blocks_other_failure', {})
+    guard.require(process_native.get('status') == 'passed' and process_native.get('native')
+                  and all(x.get('exit_code') == 0 and x.get('request_count', 0) > 0
+                          and len(x.get('control', {}).get('last_audit', {}).get('reviewed_diagnostic_failures', [])) == 1
+                          and x.get('control', {}).get('last_audit', {}).get('unfinished') == ['command:'+'f'*64]
+                          and x.get('control', {}).get('diagnostic_attempts', [{}])[0].get('exit_code') == 1
+                          and x.get('control', {}).get('last_audit', {}).get('tests_auto_started') == 0
+                          for x in process_native['native']), 'Missing native ps review and unrelated-failure rejection')
+    actual_process = cases.get('test_captured_actual_83_ps_query_preserves_native_failure', {})
+    facts = actual_process.get('core') or {}
+    guard.require(actual_process.get('status') == 'passed' and facts.get('original_exit_code') == 1
+                  and facts.get('execution_argv', [])[:1] == ['/bin/ps']
+                  and all(facts.get(name) is True for name in ['original_failure_preserved', 'resources_closed',
+                      'actual_project_and_failure_unchanged']), 'Missing actual captured native process-query verification')
     engine = guard.no_links(Path(report['engine']).resolve())
     version = subprocess.check_output([str(engine), '--version'], text=True, timeout=10).strip()
     guard.require(version == report.get('engine_version'), 'Native engine changed since acceptance')
@@ -227,6 +259,7 @@ def _install(home, repo, report_path, report_sha, promote=False):
     pinned = [{'path': str(runtime / name), 'sha256': digest(runtime / name)} for name in RUNTIME_FILES]
     settings = {'schema_version': 1, 'scope': 'configured' if promote else 'pilot',
                 'pilot_roots': [str(repo)], 'heavy_tests': ['ai'], 'pinned_files': pinned,
+                'process_query_origins': report.get('process_origins', {}),
                 'protected_files': [str(global_file), str(home / 'config.toml')],
                 'validation': {'path': str(report_path), 'sha256': report_sha,
                                'engine_version': report['engine_version']}}

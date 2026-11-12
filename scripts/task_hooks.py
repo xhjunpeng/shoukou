@@ -439,7 +439,7 @@ class Hooks:
                 key = guard.digest([str(repo), state['session_id']])[:32]
                 try:
                     result = management.review_diagnostic(guard, repo, state, control,
-                        lambda: guard.atomic(self.state_root / (key + '.json'), state))
+                        lambda: guard.atomic(self.state_root / (key + '.json'), state), self.policy.get('process_query_origins', {}))
                 except (ValueError, OSError, KeyError, TypeError) as error:
                     return deny('诊断复核未通过，原始失败保留：' + str(error))
             else:
@@ -555,7 +555,8 @@ class Hooks:
         failed = [x for x in all_pending if x not in deferred]
         if state.get('resume_binding_required'):
             failed.append({'object': 'existing-task-binding-required', 'version': guard.digest(state['resume_candidates'])})
-        reviewed = management.reviewed_diagnostics(guard, repo, state, result['candidate'])
+        reviewed = management.reviewed_diagnostics(guard, repo, state, result['candidate'],
+                                                  self.policy_path.parent.parent.parent, self.policy.get('process_query_origins', {}))
         failed.extend({'object': 'command:' + key, 'version': guard.digest(facts)}
                       for key, facts in state.get('command_failures', {}).items() if key not in reviewed)
         failed.extend(management.diagnostic_resources(guard, state))

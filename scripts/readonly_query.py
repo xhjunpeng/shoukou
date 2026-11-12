@@ -15,6 +15,23 @@ CALLS = {'Path', 'print', 'str', 'len', 'list', 'dict', 'all', 'any', 'sorted', 
 ATTRS = {'read_text', 'read_bytes', 'exists', 'is_file', 'is_dir', 'is_symlink', 'glob', 'rglob', 'iterdir', 'stat', 'st_size', 'get', 'items', 'values', 'keys', 'loads', 'dumps', 'sha256', 'hexdigest', 'join', 'name', 'parent', 'stem', 'suffix', 'parts'}
 
 
+def process_query(command):
+    """One PID, fixed read-only ps columns; never execute a shell or PATH alias."""
+    parts = segments(command)
+    if not parts or len(parts) != 1:
+        return None
+    try:
+        args = shlex.split(command)
+    except ValueError:
+        return None
+    if (len(args) != 5 or args[0] not in {'ps', '/bin/ps'}
+            or args[1:4] != ['-o', 'pid,ppid,pgid,etime,command', '-p']
+            or not re.fullmatch(r'[1-9][0-9]{0,9}', args[4]) or int(args[4]) > 2147483647
+            or shutil.which(args[0]) != '/bin/ps'):
+        return None
+    return {'argv': ['/bin/ps', *args[1:]], 'pid': int(args[4]), 'kind': 'process-presence-query', 'sites': []}
+
+
 def query_python(command):
     """Return an isolated command for the small data-query subset, or None."""
     match = re.fullmatch(r"([^\n]+?)\s+<<\s*['\"]?([A-Za-z_][A-Za-z_0-9]*)['\"]?\n(.*)\n\2\s*", command, re.S)
@@ -81,6 +98,9 @@ def diagnostic_correction(original, corrected):
     Both commands must be in the isolated read-only subset. This first version
     deliberately does not decide whether arbitrary rewritten code is equivalent.
     """
+    process = process_query(original)
+    if process is not None and original == corrected:
+        return process
     before, after = query_python(original), query_python(corrected)
     if before is None or after is None:
         raise ValueError('Both diagnostic commands must be bounded read-only Python queries')
@@ -195,6 +215,9 @@ def simple_read(command):
 
 
 def readonly_command(command):
+    process = process_query(command)
+    if process is not None:
+        return shlex.join(process['argv'])
     python = query_python(command)
     if python is not None:
         return python

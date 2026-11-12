@@ -79,7 +79,7 @@ def native_hook_list(home, repo, timeout=15):
                 'listing': listing, 'stderr': errors.read().decode(errors='replace')}
 
 
-def native_run(home, repo, outputs, prompt='Edit the fixture as requested.', timeout=60, sandbox='workspace-write', model='fixture-model'):
+def native_run(home, repo, outputs, prompt='Edit the fixture as requested.', timeout=60, sandbox='workspace-write', model='fixture-model', persist=False, resume=None):
     requests = []
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -121,7 +121,8 @@ def native_run(home, repo, outputs, prompt='Edit the fixture as requested.', tim
             '-c', 'model_providers.fixture={name="Local validation only",base_url="http://127.0.0.1:' + str(server.server_port) + '/v1",wire_api="responses",requires_openai_auth=false}',
             '-c', 'features.shell_snapshot=false', '-c', 'features.memories=false',
             '-c', 'features.plugins=false', '-c', 'features.apps=false',
-            'exec', '--ephemeral', '--ignore-user-config', '--json', '--skip-git-repo-check', prompt]
+            'exec', *([] if persist or resume else ['--ephemeral']), '--ignore-user-config', '--json',
+            '--skip-git-repo-check', *(['resume', resume] if resume else []), prompt]
     env = dict(os.environ, CODEX_HOME=str(home), DO_NOT_TRACK='1')
     # Explicit fixture provider never reads user credentials or inherited API keys.
     for key in list(env):

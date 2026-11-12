@@ -27,6 +27,7 @@ def parser(add_help=True):
     cli.add_argument('--apply', action='store_true')
     cli.add_argument('--repo'); cli.add_argument('--session'); cli.add_argument('--task')
     cli.add_argument('--failed'); cli.add_argument('--original'); cli.add_argument('--corrected'); cli.add_argument('--reason')
+    cli.add_argument('--native-source'); cli.add_argument('--native-result')
     return cli
 
 
@@ -254,8 +255,89 @@ def diagnostic_coverage(path):
             'skipped_inputs': [x for x in records if x['object'] is False]}
 
 
+def diagnostic_files(kind):
+    names = {'original-command.txt', 'corrected-command.txt', 'coverage.json', 'stdout.log', 'stderr.log'}
+    if kind == 'process-presence-query':
+        names |= {'native-source.json', 'native-result.jsonl'}
+    return names
+
+
+def native_json(data):
+    try:
+        return json.loads(data)
+    except RecursionError as error:
+        raise ValueError('Native query evidence is nested too deeply') from error
+
+
+def process_origin(core, repo, state, original, facts, home, source_bytes, result_bytes, approved_origins):
+    """Bind the empty original ps result to the original native journal, not caller claims."""
+    require(len(source_bytes) <= 32768 and len(result_bytes) <= core.MAX_LOG_BYTES, 'Native evidence is too large')
+    meta = native_json(source_bytes)
+    require(isinstance(meta, dict) and set(meta) == {'format', 'source', 'offset', 'result_sha256'}
+            and meta['format'] == 'native-process-query-source-v1'
+            and isinstance(meta['source'], str)
+            and type(meta['offset']) is int and meta['offset'] >= 0
+            and meta['result_sha256'] == digest(result_bytes), 'Invalid native query provenance')
+    require(isinstance(approved_origins, dict), 'Accepted process-query origins required')
+    approved = approved_origins.get(core.digest(original))
+    require(isinstance(approved, dict) and core.digest(meta) == core.digest(approved),
+            'Native query source was not pinned by this accepted installation')
+    source = safe(meta['source']); home = safe(home)
+    require(source.is_relative_to(home / 'sessions') and source.name.startswith('rollout-')
+            and source.suffix == '.jsonl' and source.is_file(), 'Original Codex session journal required')
+    with source.open('rb') as stream:
+        require(meta['offset'] < os.fstat(stream.fileno()).st_size and meta['offset'] <= sys.maxsize,
+                'Native journal offset is outside the original file')
+        stream.seek(meta['offset'])
+        require(stream.readline(core.MAX_LOG_BYTES + 1) == result_bytes, 'Original native journal bytes changed')
+    event = native_json(result_bytes)
+    require(isinstance(event, dict) and isinstance(event.get('payload'), dict), 'Invalid native event')
+    payload = event['payload']; item = payload.get('item', {})
+    require(isinstance(item, dict), 'Invalid native command execution')
+    require(event.get('type') == 'event_msg' and payload.get('type') == 'item_completed'
+            and payload.get('thread_id') == state['session_id'] and item.get('type') == 'CommandExecution'
+            and item.get('id') == facts.get('tool_use_id') and item.get('status') == 'failed'
+            and type(item.get('exit_code')) is int and item['exit_code'] == 1
+            and type(facts.get('exit_code')) is int and facts['exit_code'] == 1
+            and item.get('cwd') == repo.as_uri(), 'Native failure is not this original query/session/repository')
+    argv = item.get('command'); output = item.get('aggregated_output')
+    require(isinstance(argv, list) and len(argv) == 3 and argv[:2] == ['/bin/zsh', '-lc']
+            and isinstance(argv[-1], str) and isinstance(output, str), 'Original native shell/output unavailable')
+    markers = re.findall(r'__CODEX_TASK_EXIT_[0-9a-f]{32}__', argv[-1])
+    require(len(markers) == 1, 'Exact original exit marker required')
+    marker = markers[0]
+    wrapped = '(\n' + original + '\n)\ncodex_task_exit=$?\nprintf "\\n' + marker + ':%s\\n" "$codex_task_exit"\nexit "$codex_task_exit"'
+    require(argv[-1] == wrapped, 'Native command is not the exact original query')
+    lines = [line.split() for line in output.splitlines() if line.strip()]
+    require(lines == [['PID', 'PPID', 'PGID', 'ELAPSED', 'COMMAND'], [marker + ':1']],
+            'Original ps result must be an empty table, without errors or process rows')
+
+
+def process_coverage(evidence, relation, code):
+    require(type(code) is int and code in {0, 1}, 'ps query did not return a known result')
+    require((evidence / 'stderr.log').read_bytes() == b'', 'ps query reported an error')
+    rows = [line.split(None, 4) for line in (evidence / 'stdout.log').read_text().splitlines() if line.strip()]
+    require(rows and rows[0] == ['PID', 'PPID', 'PGID', 'ELAPSED', 'COMMAND'], 'ps table header changed')
+    records = rows[1:]
+    require((code == 1 and not records) or (code == 0 and len(records) == 1 and len(records[0]) == 5
+            and records[0][0] == str(relation['pid']) and all(re.fullmatch(r'[0-9]+', n) for n in records[0][:3])
+            and re.fullmatch(r'[0-9:-]+', records[0][3]) and bool(records[0][4])),
+            'ps result does not describe the exact requested PID')
+    return {'query_exit': code, 'observed_processes': records,
+            'queried_pid': relation['pid'], 'outcome': 'no-matching-process' if code == 1 else 'matching-process-now'}
+
+
+def review_coverage(entry, evidence):
+    if entry['kind'] != 'process-presence-query':
+        return diagnostic_coverage(evidence / 'coverage.json')
+    from readonly_query import process_query
+    relation = process_query((evidence / 'original-command.txt').read_text())
+    require(relation is not None, 'Unknown process query')
+    return process_coverage(evidence, relation, entry['exit_code'])
+
+
 def seal_diagnostic(entry, evidence):
-    names = ['original-command.txt', 'corrected-command.txt', 'coverage.json', 'stdout.log', 'stderr.log']
+    names = diagnostic_files(entry['kind'])
     entry['files'] = {}
     for name in names:
         path = safe(evidence / name)
@@ -263,7 +345,7 @@ def seal_diagnostic(entry, evidence):
             entry['files'][name] = digest(path.read_bytes())
     entry['coverage'] = None
     try:
-        entry['coverage'] = diagnostic_coverage(evidence / 'coverage.json')
+        entry['coverage'] = review_coverage(entry, evidence)
     except (ValueError, OSError, KeyError, TypeError):
         pass
 
@@ -290,6 +372,11 @@ def run_diagnostic(core, repo, state, request, checkpoint):
     for name in ['original', 'corrected']:
         path = evidence / (name + '-command.txt')
         path.write_text(request[name]); path.chmod(0o400)
+    if request['kind'] == 'process-presence-query':
+        entry['native_home'] = request['native_home']
+        entry['execution_argv'] = request['argv']
+        for name in ['native-source.json', 'native-result.jsonl']:
+            path = evidence / name; path.write_bytes(request[name]); path.chmod(0o400)
     environment = dict(os.environ, **{key: str(work) for key in ['CODEX_TASK_TMP_ROOT', 'TMPDIR', 'TMP', 'TEMP']})
     truncated = []; threads = []; child = None
     def drain(pipe, destination):
@@ -302,8 +389,13 @@ def run_diagnostic(core, repo, state, request, checkpoint):
                 if count > core.MAX_LOG_BYTES and destination.name not in truncated:
                     truncated.append(destination.name)
     try:
-        payload = json.dumps({'source': request['argv'][-1], 'sites': request['sites']})
-        child = subprocess.Popen([sys.executable, '-I', '-B', '-c', DIAGNOSTIC_CHILD, payload], cwd=repo,
+        if request['kind'] == 'process-presence-query':
+            argv = request['argv']
+            environment['LC_ALL'] = 'C'
+        else:
+            payload = json.dumps({'source': request['argv'][-1], 'sites': request['sites']})
+            argv = [sys.executable, '-I', '-B', '-c', DIAGNOSTIC_CHILD, payload]
+        child = subprocess.Popen(argv, cwd=repo,
                                  env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
         entry['pgid'] = child.pid; checkpoint()
         for pipe, name in [(child.stdout, 'stdout.log'), (child.stderr, 'stderr.log')]:
@@ -328,6 +420,11 @@ def run_diagnostic(core, repo, state, request, checkpoint):
             core.remove_run_work(entry)
         entry.update(status='complete', exit_code=code, violations=violations, active_descendants=active,
                      work_reclaimed=not work.exists(), finished_at=time.time())
+        if request['kind'] == 'process-presence-query':
+            try:
+                core.atomic(evidence / 'coverage.json', process_coverage(evidence, request, code))
+            except (ValueError, OSError, KeyError, TypeError):
+                entry['violations'].append('invalid-process-query-result')
     except BaseException as error:
         entry.update(status='interrupted', error_type=type(error).__name__)
         if child is not None:
@@ -384,7 +481,7 @@ def diagnostic_resources(core, state):
     return pending
 
 
-def reviewed_diagnostics(core, repo, state, candidate):
+def reviewed_diagnostics(core, repo, state, candidate, home=None, approved_origins=None):
     """Validate receipts on every audit; failures and failed attempts remain intact."""
     from readonly_query import diagnostic_correction
     accepted = set()
@@ -402,22 +499,25 @@ def reviewed_diagnostics(core, repo, state, candidate):
                     and attempt['session_id'] == state['session_id'] and attempt['policy_sha256'] == state['policy_sha256']
                     and attempt['failed_command'] == review['failed_command']
                     and attempt['candidate'] == candidate and attempt['status'] == 'complete'
-                    and attempt['exit_code'] == 0 and not attempt['violations'] and attempt['work_reclaimed']
+                    and type(attempt['exit_code']) is int
+                    and attempt['exit_code'] in ({0, 1} if review['kind'] == 'process-presence-query' else {0})
+                    and not attempt['violations'] and attempt['work_reclaimed']
                     and type(attempt['pgid']) is int and attempt['pgid'] > 0
                     and core.run_group_active(attempt) is False and core.evidence_ok(attempt['receipt']),
                     'Diagnostic execution receipt is not successful for this candidate')
             bound = ['repo', 'session_id', 'task', 'policy_sha256', 'candidate', 'failed_command',
                      'failure_facts', 'failure_version', 'files', 'kind', 'reason', 'corrected_sha256']
+            if review['kind'] == 'process-presence-query': bound.extend(['native_home', 'execution_argv'])
             require(core.digest({k: review[k] for k in bound}) == core.digest({k: attempt[k] for k in bound})
                     and core.digest(review['failure_facts']) == core.digest(facts),
                     'Review facts do not match the sealed execution')
             for name, sha in review['files'].items():
-                require(name in {'original-command.txt', 'corrected-command.txt', 'coverage.json', 'stdout.log', 'stderr.log'},
+                require(name in diagnostic_files(review['kind']),
                         'Unknown diagnostic evidence file')
                 file = safe(evidence / name)
                 require(file.is_file() and file.stat().st_size <= 2 * 1024 * 1024
                         and digest(file.read_bytes()) == sha, 'Diagnostic evidence changed')
-            require(set(review['files']) == {'original-command.txt', 'corrected-command.txt', 'coverage.json', 'stdout.log', 'stderr.log'},
+            require(set(review['files']) == diagnostic_files(review['kind']),
                     'Incomplete diagnostic evidence')
             original = (evidence / 'original-command.txt').read_text()
             require(core.digest(original) == review['failed_command'], 'Original command mismatch')
@@ -425,9 +525,17 @@ def reviewed_diagnostics(core, repo, state, candidate):
             relation = diagnostic_correction(original, corrected)
             require(relation['kind'] == review['kind'] and digest(corrected.encode()) == review['corrected_sha256'],
                     'Corrected query identity changed')
-            expected = diagnostic_coverage(evidence / 'coverage.json')
-            require(expected['observed_objects'] > 0 and expected['skipped_inputs'], 'No actual correction coverage')
-            shown = {k: review[k] for k in ['observed_objects', 'skipped_inputs']}
+            expected = review_coverage(attempt, evidence)
+            if relation['kind'] == 'process-presence-query':
+                require(review['execution_argv'] == relation['argv'], 'Fixed ps execution changed')
+                home = home or os.environ.get('CODEX_HOME', str(Path.home() / '.codex'))
+                require(safe(review['native_home']) == safe(home), 'Process review home changed')
+                process_origin(core, repo, state, original, facts, home,
+                    (evidence / 'native-source.json').read_bytes(), (evidence / 'native-result.jsonl').read_bytes(), approved_origins)
+                require(core.digest(read(evidence / 'coverage.json')) == core.digest(expected), 'ps coverage changed')
+            else:
+                require(expected['observed_objects'] > 0 and expected['skipped_inputs'], 'No actual correction coverage')
+            shown = {k: review[k] for k in expected}
             require(core.digest(attempt['coverage']) == core.digest(expected) == core.digest(shown),
                     'Diagnostic coverage summary changed')
             accepted.add(review['failed_command'])
@@ -436,7 +544,7 @@ def reviewed_diagnostics(core, repo, state, candidate):
     return accepted
 
 
-def review_diagnostic(core, repo, state, options, checkpoint):
+def review_diagnostic(core, repo, state, options, checkpoint, approved_origins=None):
     from readonly_query import diagnostic_correction
     require(options.repo == str(repo) and options.session == state['session_id'] and options.task == state['task'],
             'Review must name this exact repository, original task and native session')
@@ -453,6 +561,15 @@ def review_diagnostic(core, repo, state, options, checkpoint):
         commands[name] = path.read_text()
     require(core.digest(commands['original']) == options.failed, 'Original text does not match the recorded failure')
     relation = diagnostic_correction(commands['original'], commands['corrected'])
+    native = {}
+    if relation['kind'] == 'process-presence-query':
+        for option, name in [('native_source', 'native-source.json'), ('native_result', 'native-result.jsonl')]:
+            path = safe(getattr(options, option) or '')
+            require(path.is_file() and 0 < path.stat().st_size <= core.MAX_LOG_BYTES, 'Bounded original native evidence required')
+            native[name] = path.read_bytes()
+        process_origin(core, repo, state, commands['original'], original_facts, options.home,
+                       native['native-source.json'], native['native-result.jsonl'], approved_origins)
+        native['native_home'] = str(safe(options.home))
     cfg, _ = core.config_of(repo)
     candidate = core.source_snapshot(repo, cfg)['content_fingerprint']
     plan = {'state': 'planned', 'action': 'review-diagnostic', 'failed_command': options.failed,
@@ -460,35 +577,38 @@ def review_diagnostic(core, repo, state, options, checkpoint):
     if not options.apply: return plan
     for existing in state.get('diagnostic_reviews', []):
         if (existing.get('failed_command') == options.failed and existing.get('corrected_sha256') == digest(commands['corrected'].encode())
-                and options.failed in reviewed_diagnostics(core, repo, state, candidate)):
+                and options.failed in reviewed_diagnostics(core, repo, state, candidate, options.home, approved_origins)):
             return dict(plan, state='reviewed', receipt=existing['receipt'], changed=False)
     entry = run_diagnostic(core, repo, state, dict(commands, failed=options.failed, failure_facts=original_facts,
-        failure_version=core.digest(original_facts), reason=options.reason.strip(), **relation), checkpoint)
-    require(entry.get('exit_code') == 0 and not entry.get('violations') and entry.get('work_reclaimed'),
+        failure_version=core.digest(original_facts), reason=options.reason.strip(), **relation, **native), checkpoint)
+    require(type(entry.get('exit_code')) is int
+            and entry['exit_code'] in ({0, 1} if relation['kind'] == 'process-presence-query' else {0})
+            and not entry.get('violations') and entry.get('work_reclaimed'),
             'Corrected diagnostic failed or left uncertain resources; original failure retained')
     require(entry['candidate'] == candidate and core.source_snapshot(repo, cfg)['content_fingerprint'] == candidate,
             'Project candidate changed during review; nothing accepted')
-    require(state.get('command_failures', {}).get(options.failed) == original_facts,
+    require(core.digest(state.get('command_failures', {}).get(options.failed)) == core.digest(original_facts),
             'Original failure changed during review; nothing accepted')
     evidence = Path(entry['root']) / 'evidence'
-    coverage = diagnostic_coverage(evidence / 'coverage.json')
-    require(coverage['observed_objects'] > 0 and coverage['skipped_inputs'],
-            'Correction did not cover both valid objects and skipped non-objects')
+    coverage = review_coverage(entry, evidence)
+    if relation['kind'] != 'process-presence-query':
+        require(coverage['observed_objects'] > 0 and coverage['skipped_inputs'],
+                'Correction did not cover both valid objects and skipped non-objects')
     review = {'repo': str(repo), 'session_id': state['session_id'], 'task': state['task'],
               'policy_sha256': state['policy_sha256'], 'candidate': entry['candidate'],
               'failed_command': options.failed, 'failure_version': core.digest(original_facts), 'failure_facts': original_facts,
               'reason': options.reason.strip(), 'kind': relation['kind'], 'receipt': entry['receipt'],
               'corrected_sha256': digest(commands['corrected'].encode()),
-              'files': copy.deepcopy(entry['files']),
-              'observed_objects': coverage['observed_objects'], 'skipped_inputs': coverage['skipped_inputs']}
+              'files': copy.deepcopy(entry['files']), **coverage}
+    if relation['kind'] == 'process-presence-query':
+        review.update(native_home=entry['native_home'], execution_argv=entry['execution_argv'])
     proposed = copy.deepcopy(state)
     proposed.setdefault('diagnostic_reviews', []).append(review)
-    require(options.failed in reviewed_diagnostics(core, repo, proposed, candidate), 'Review did not survive receipt verification')
+    require(options.failed in reviewed_diagnostics(core, repo, proposed, candidate, options.home, approved_origins), 'Review did not survive receipt verification')
     # The native handler owns the session lock and commits this mutation only
     # after returning an allow response. Rejected requests never checkpoint a review.
     state.setdefault('diagnostic_reviews', []).append(review)
-    return dict(plan, state='reviewed', receipt=review['receipt'], observed_objects=review['observed_objects'],
-                skipped_inputs=review['skipped_inputs'], changed=True)
+    return dict(plan, state='reviewed', receipt=review['receipt'], **coverage, changed=True)
 
 
 def record_stop_observation(home, policy_sha256, state):
