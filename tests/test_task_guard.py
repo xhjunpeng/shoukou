@@ -167,6 +167,40 @@ class TaskGuardTests(unittest.TestCase):
         guard.atomic(self.repo / '.git/codex-workflow/task.json', state)
         self.assertEqual(self.check()['state'], 'complete')
 
+    def test_unknown_process_group_never_completes_reclaimed_interruption(self):
+        argv, interrupted = self.interrupted_after_reclamation()
+        guard.run_task(self.repo, 'task', argv)
+        normal = self.check()
+        self.assertEqual(normal['state'], 'complete')
+        self.core_evidence = {'normal': normal, 'unknown_groups': [], 'original_runs': []}
+        for run in self.state()['runs']:
+            root = Path(run['root'])
+            self.core_evidence['original_runs'].append({
+                'record': copy.deepcopy(run),
+                'stdout': (root / 'evidence/stdout.log').read_text(),
+                'stderr': (root / 'evidence/stderr.log').read_text()})
+        key = 'run-resource:' + interrupted['id']
+        for label, group in [('missing', None), ('null', None), ('zero', 0),
+                             ('negative', -1), ('boolean', True), ('text', 'unknown')]:
+            with self.subTest(group=label):
+                state = self.state()
+                state['runs'][0]['pgid'] = group
+                if label == 'missing':
+                    state['runs'][0].pop('pgid')
+                original = copy.deepcopy(state['runs'][0])
+                guard.atomic(self.repo / '.git/codex-workflow/task.json', state)
+                checked = self.check()
+                self.core_evidence['unknown_groups'].append({'input': label, 'result': checked,
+                                                             'original_record': original})
+                self.assertIn(key, self.objects(checked))
+                self.assertNotEqual(checked['state'], 'complete')
+                self.assertEqual(checked['reconciled_run_resources'], [])
+                self.assertEqual(self.state()['runs'][0], original)
+        state = self.state()
+        state['runs'][0] = interrupted
+        guard.atomic(self.repo / '.git/codex-workflow/task.json', state)
+        self.assertEqual(self.check()['state'], 'complete')
+
     def test_clean_task_and_preexisting_other_branch_do_not_require_global_cleanup(self):
         self.git('branch', 'other-task')
         self.begin()

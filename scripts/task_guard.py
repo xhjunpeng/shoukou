@@ -534,7 +534,8 @@ def check_task(repo, task, phase='final', decision_paths=(), stop_paths=()):
                 active = group_active(run.get('pgid'))
                 replay = next((item for item in reversed(state['runs'][position + 1:])
                                if item['command_key'] == run['command_key']), {})
-                if (run.get('status') in ('running', 'interrupted') and active is False
+                if (type(run.get('pgid')) is int and run['pgid'] > 0
+                        and run.get('status') in ('running', 'interrupted') and active is False
                         and runner_active(run.get('runner_pid')) is False and reclaimed_interruption(run)
                         and replay.get('status') == 'complete' and replay.get('exit_code') == 0
                         and not replay.get('violations') and replay.get('candidate') == candidate
